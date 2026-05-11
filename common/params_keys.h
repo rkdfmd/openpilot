@@ -160,7 +160,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"ShowPathModeLane", {PERSISTENT, INT, "3"}},
     {"ShowPathColorLane", {PERSISTENT, INT, "20"}},
     {"ShowPlotMode", {PERSISTENT, INT, "1"}},
-    {"CarrotTireTrajectory", {PERSISTENT, INT, "0"}},
+    {"CarrotTireTrajectory", {PERSISTENT, INT, "1"}},
     {"RecordRoadCam", {PERSISTENT, INT, "1"}},
     {"HDPuse", {PERSISTENT, INT, "0"}},
 
