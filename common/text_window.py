@@ -14,7 +14,7 @@ def with_recovery_label(text):
     start_ip_monitor()
     label = label_with_port(RECOVERY_PORT)
   except Exception:
-    label = "no network"
+    label = "핫스팟 대기중"
   return f"Recovery: {label}\n\n{text}"
 
 
