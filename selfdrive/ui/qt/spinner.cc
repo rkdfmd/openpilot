@@ -63,7 +63,7 @@ static QString getLocalIPv4() {
 
 static QString recoveryLabel() {
   QString ip = getLocalIPv4();
-  if (ip.isEmpty()) return QStringLiteral("no network");
+  if (ip.isEmpty()) return QStringLiteral("핫스팟 대기중");
   return ip + QStringLiteral(":6999");
 }
 
