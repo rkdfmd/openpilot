@@ -51,4 +51,4 @@ def current_ip():
 
 def label_with_port(port):
   ip = current_ip()
-  return f"{ip}:{port}" if ip else "no network"
+  return f"{ip}:{port}" if ip else "핫스팟 대기중"
