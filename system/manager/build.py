@@ -55,7 +55,7 @@ def build(spinner: Spinner, dirty: bool = False, minimal: bool = False) -> None:
         elif len(line):
           compile_output.append(line)
           line_text = line.decode('utf8', 'replace')
-          spinner.update("오픈파일럿 준비중")
+          spinner.update("강릉파일럿 준비중")
           print(line_text)
       except Exception:
         pass
