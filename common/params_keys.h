@@ -132,7 +132,6 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"TrafficLight", {CLEAR_ON_MANAGER_START, STRING}},
     {"ApiCache_NavDestinations", {PERSISTENT, STRING}},
 
-    {"ApiCache_NavDestinations", {PERSISTENT, STRING}},
     {"NavDestination", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, STRING}},
     {"NavDestinationWaypoints", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, STRING}},
     {"NavPastDestinations", {PERSISTENT, STRING}},
