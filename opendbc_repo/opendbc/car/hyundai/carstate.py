@@ -397,6 +397,11 @@ class CarState(CarStateBase):
       aeb_warning = cp_cruise.vl[aeb_src]["CF_VSM_Warn"] != 0
       scc_warning = cp_cruise.vl["SCC12"]["TakeOverReq"] == 1  # sometimes only SCC system shows an FCW
       aeb_braking = cp_cruise.vl[aeb_src]["CF_VSM_DecCmdAct"] != 0 or cp_cruise.vl[aeb_src][aeb_sig] != 0
+      if self.CP.carFingerprint == CAR.HYUNDAI_CASPER_EV and aeb_src == "FCA11":
+        fca_fault = cp_cruise.vl["FCA11"]["FCA_Failinfo"] != 0 or cp_cruise.vl["FCA11"]["FCA_Status"] == 3
+        if fca_fault:
+          aeb_warning = False
+          aeb_braking = False
       ret.stockFcw = (aeb_warning or scc_warning) and not aeb_braking
       ret.stockAeb = aeb_warning and aeb_braking
 
@@ -639,7 +644,7 @@ class CarState(CarStateBase):
       right_lane_prob = lane_info["RIGHT_LANE_PROB"]
       left_lane_type = lane_info["LEFT_LANE_TYPE"] # 0: dashed, 1: solid, 2: undecided, 3: road edge, 4: DLM Inner Solid, 5: DLM InnerDashed, 6:DLM Inner Undecided, 7: Botts Dots, 8: Barrier
       right_lane_type = lane_info["RIGHT_LANE_TYPE"]
-      left_lane_color = lane_info["LEFT_LANE_COLOR"]
+      left_lane_color = lane_info["LEFT_LANE_COLOR"]  # 0: none, 1: white, 2: yellow, 3: blue
       right_lane_color = lane_info["RIGHT_LANE_COLOR"]
       left_lane_info = left_lane_color * 10 + left_lane_type
       right_lane_info = right_lane_color * 10 + right_lane_type
