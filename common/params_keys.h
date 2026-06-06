@@ -129,6 +129,8 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"LongitudinalPersonalityMax", {PERSISTENT, INT, "4"}},
     {"NetworkAddress", {CLEAR_ON_MANAGER_START, STRING}},
     {"ScreenRecord", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, BOOL} },
+    {"TrafficLight", {CLEAR_ON_MANAGER_START, STRING}},
+    {"ApiCache_NavDestinations", {PERSISTENT, STRING}},
 
     {"ApiCache_NavDestinations", {PERSISTENT, STRING}},
     {"NavDestination", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, STRING}},
@@ -160,7 +162,12 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"ShowPathModeLane", {PERSISTENT, INT, "3"}},
     {"ShowPathColorLane", {PERSISTENT, INT, "20"}},
     {"ShowPlotMode", {PERSISTENT, INT, "1"}},
-    {"CarrotTireTrajectory", {PERSISTENT, INT, "1"}},
+    {"CarrotTireTrajectory", {PERSISTENT, INT, "0"}},
+    {"ClusterHud", {PERSISTENT, INT, "0"}},
+    {"ClusterHudBrightness", {PERSISTENT, INT, "0"}},
+    {"ClusterHudTheme", {PERSISTENT, INT, "0"}},
+    {"ClusterHudLiveFps", {PERSISTENT, INT, "0"}},
+    {"ClusterHudScreenMode", {PERSISTENT, INT, "0"}},
     {"RecordRoadCam", {PERSISTENT, INT, "1"}},
     {"HDPuse", {PERSISTENT, INT, "0"}},
 
@@ -173,6 +180,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"AutoGasSyncSpeed", {PERSISTENT, INT, "0"} },
     {"ApplyModelSpeed", {PERSISTENT, INT, "0"} },
     {"AutoEngage", {PERSISTENT, INT, "0"}},
+    {"AlwaysLateral", {PERSISTENT, INT, "1"}},
     {"DisableMinSteerSpeed", {PERSISTENT, INT, "0"}},
     {"AutoCurveSpeedLowerLimit", {PERSISTENT, INT, "29"}},
     {"AutoCurveSpeedFactor", {PERSISTENT, INT, "50"}},
@@ -204,7 +212,6 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"CruiseButtonMode", {PERSISTENT, INT, "1"}},
     {"CancelButtonMode", {PERSISTENT, INT, "0"}},
     {"LfaButtonMode", {PERSISTENT, INT, "0"}},
-    {"MainButtonMode", {PERSISTENT, INT, "0"}},
     {"CruiseButtonTest1", {PERSISTENT, INT, "2"}},
     {"CruiseButtonTest2", {PERSISTENT, INT, "13"}},
     {"CruiseButtonTest3", {PERSISTENT, INT, "1"}},
@@ -316,7 +323,6 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
 
     {"DisableDM", {PERSISTENT, INT, "1"}},
     {"MuteDoor", {PERSISTENT, INT, "1"}},
-    {"EnableConnect", {PERSISTENT, INT, "0"}},
     {"MuteSeatbelt", {PERSISTENT, INT, "1"}},
 
     {"CarrotException", {CLEAR_ON_MANAGER_START, STRING}},
