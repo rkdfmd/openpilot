@@ -558,11 +558,22 @@ class VCruiseCarrot:
         print("lfaButton")
       elif button_type == ButtonType.cancel:
         self._paddle_decel_active = False
-        if self._cancel_button_mode in [1]:
-          self._lat_enabled = False
-          self._add_log("Lateral " + "enabled" if self._lat_enabled else "disabled")
-        self._cruise_cancel_state = True
-        #self._v_cruise_kph_at_brake = 0
+
+        if CC.enabled:
+          # 크루즈 작동 중: 일시 해제
+          if self._cancel_button_mode in [1]:
+            self._lat_enabled = False
+            self._add_log("Lateral disabled")
+
+          self._cruise_cancel_state = True
+          self._add_log("Cruise paused by cancel button")
+
+        elif self._cruise_cancel_state and CS.cruiseState.available and not CS.brakePressed:
+          # 가운데 버튼으로 해제한 상태에서 재입력: 이전 속도로 재개
+          self._cruise_cancel_state = False
+          self.autoCruiseControl_cancel_timer = 0
+          self._lat_enabled = True
+          self._cruise_control(1, -1, "Cruise resume by cancel button")
     else:
       if button_type == ButtonType.accelCruise:
         v_cruise_kph = button_kph
