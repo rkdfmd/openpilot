@@ -615,7 +615,7 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
 
   EventName.preLaneChangeRight: {
     ET.WARNING: Alert(
-      "안전 확인 후 오쪽으로 조향하세요",
+      "안전 확인 후 오른쪽으로 조향하세요",
       "",
       AlertStatus.normal, AlertSize.none,
       Priority.LOW, VisualAlert.none, AudibleAlert.none, .1),
