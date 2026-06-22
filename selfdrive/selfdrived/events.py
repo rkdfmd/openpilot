@@ -198,10 +198,10 @@ class NormalPermanentAlert(Alert):
 
 
 class StartupAlert(Alert):
-  def __init__(self, alert_text_1: str, alert_text_2: str = "Always keep hands on wheel and eyes on road", alert_status=AlertStatus.normal):
+  def __init__(self, alert_text_1: str, alert_text_2: str = "운전은 저에게 맡기세요", alert_status=AlertStatus.normal):
     alert_size = AlertSize.mid
     if HARDWARE.get_device_type() == 'mici':
-      if alert_text_2 == "Always keep hands on wheel and eyes on road":
+      if alert_text_2 == "운전은 저에게 맡기세요":
         alert_text_2 = ""
       alert_size = AlertSize.small
     super().__init__(alert_text_1, alert_text_2,
@@ -444,7 +444,7 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
   },
 
   EventName.startup: {
-    ET.PERMANENT: StartupAlert("Be ready to take over at any time")
+    ET.PERMANENT: StartupAlert("강릉 파일럿 준비 완료")
   },
 
   EventName.startupMaster: {
