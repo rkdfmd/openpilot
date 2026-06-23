@@ -137,7 +137,7 @@ class Soundd:
     for sound in sound_list:
       filename, play_count, volume = sound_list[sound]
 
-      if self.lang == "main_ko":
+      if self.lang in ("main_ko", "ko"):
         wavefile = wave.open(BASEDIR + "/selfdrive/assets/sounds/" + filename, 'r')
       elif self.lang == "main_zh-CHS":
         wavefile = wave.open(BASEDIR + "/selfdrive/assets/sounds_chs/" + filename, 'r')
