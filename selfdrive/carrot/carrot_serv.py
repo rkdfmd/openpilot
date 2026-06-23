@@ -227,7 +227,7 @@ class CarrotServ:
         lang_val = lang_val
       except Exception:
         lang_val = None
-    if lang_val == "main_ko":
+    if lang_val in ("main_ko", "ko"):
       self.lang = "ko"
     elif lang_val == "main_zh-CHS":
       self.lang = "zh"
