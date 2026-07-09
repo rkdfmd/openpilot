@@ -198,8 +198,8 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"AutoSpeedUptoRoadSpeedLimit", {PERSISTENT, INT, "0"}},
     {"AutoRoadSpeedAdjust", {PERSISTENT, INT, "100"}},
 
-    {"StopDistanceCarrot", {PERSISTENT, INT, "550"}},
-    {"JLeadFactor3", {PERSISTENT, INT, "0"}},
+    {"StopDistanceCarrot", {PERSISTENT, INT, "530"}},
+    {"JLeadFactor3", {PERSISTENT, INT, "25"}},
     {"CruiseButtonMode", {PERSISTENT, INT, "3"}},
     {"CancelButtonMode", {PERSISTENT, INT, "0"}},
     {"LfaButtonMode", {PERSISTENT, INT, "0"}},
@@ -241,9 +241,9 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"LongActuatorDelay", {PERSISTENT, INT, "32"}},
     {"VEgoStopping", {PERSISTENT, INT, "3"}},
 
-    {"RadarReactionFactor", {PERSISTENT, INT, "50"}},
+    {"RadarReactionFactor", {PERSISTENT, INT, "75"}},
     {"EnableRadarTracks", {PERSISTENT, INT, "2"}},
-    {"RadarLatFactor", {PERSISTENT, INT, "300"}},
+    {"RadarLatFactor", {PERSISTENT, INT, "150"}},
     {"EnableCornerRadar", {PERSISTENT, INT, "1"}},
 
     {"EnableRadarTracksResult", {PERSISTENT | CLEAR_ON_MANAGER_START, INT}},
@@ -261,12 +261,12 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"SoundVolumeAdjust", {PERSISTENT, INT, "150"}},
     {"SoundVolumeAdjustEngage", {PERSISTENT, INT, "100"}},
 
-    {"TFollowGap1", {PERSISTENT, INT, "40"}},
+    {"TFollowGap1", {PERSISTENT, INT, "60"}},
     {"TFollowGap2", {PERSISTENT, INT, "90"}},
     {"TFollowGap3", {PERSISTENT, INT, "140"}},
     {"TFollowGap4", {PERSISTENT, INT, "200"}},
 
-    {"DynamicTFollow", {PERSISTENT, INT, "0"}},
+    {"DynamicTFollow", {PERSISTENT, INT, "35"}},
     {"DynamicTFollowLC", {PERSISTENT, INT, "50"}},
     {"TFollowDecelBoost", {PERSISTENT, INT, "0"}},
     {"EnableSpeedTF", {PERSISTENT, INT, "0"}},
@@ -300,7 +300,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"LateralTorqueAccelFactor", {PERSISTENT, INT, "2645"}},
     {"LateralTorqueFriction", {PERSISTENT, INT, "50"}},
     {"LateralTorqueKpV", {PERSISTENT, INT, "115"}},
-    {"LateralTorqueKiV", {PERSISTENT, INT, "05"}},
+    {"LateralTorqueKiV", {PERSISTENT, INT, "5"}},
     {"LateralTorqueKf", {PERSISTENT, INT, "80"}},
     {"LateralTorqueKd", {PERSISTENT, INT, "0"}},
 
