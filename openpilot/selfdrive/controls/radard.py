@@ -44,6 +44,9 @@ CUTIN_ENTER_PROB_GAIN = 0.12
 CUTIN_KEEP_FUTURE_IN_LANE_PROB = 0.12
 CUTIN_KEEP_MAX_DPATH_FUTURE = 1.6
 CUTIN_KEEP_MAX_MOVING_AWAY = 0.3
+CORNER_ACCEL_MIN_TRACK_AGE = 6
+CORNER_ACCEL_MAX_ABS_DPATH = 1.5
+CORNER_ACCEL_MAX_ABS_ALEAD = 3.0
 CUTIN_PROMOTE_DREL_MARGIN = 1.0
 CORNER_FRONT_MATCH_PROMOTE_DREL_MARGIN = 8.0
 CUTIN_DEFAULT_CONFIRM_S = 0.20
@@ -92,10 +95,6 @@ CORNER_STOPPED_FAR_IN_LANE_PROB = 0.5
 CORNER_STOPPED_FAR_DREL = 60.0
 CORNER_VISION_KEEP_PROB = 0.75
 FRONT_RADAR_VISION_MATCH_MIN_PROB = 0.4
-CORNER_YAW_COMP_GAIN = 1.0
-CORNER_YAW_COMP_MAX_YAW_RATE = 0.35
-CORNER_YAW_COMP_MAX_YVREL_CORRECTION = 4.0
-CORNER_YAW_COMP_MAX_VREL_CORRECTION = 1.5
 
 def laplacian_pdf(x: float, mu: float, b: float):
   diff = abs(x - mu) / max(b, 1e-4)
@@ -202,7 +201,7 @@ class Track:
     self._vLead_filt = 0.0
     self._vLead_filt_init = False
 
-  def update(self, md, pt, ready, radar_reaction_factor, radar_lat_factor, yaw_rate: float = 0.0, yaw_comp: bool = False):
+  def update(self, md, pt, ready, radar_reaction_factor, radar_lat_factor):
     prev_measured = self.measured
     prev_dRel = self.dRel
     prev_yRel = self.yRel
@@ -216,19 +215,6 @@ class Track:
     self.aLead = self.aLeadK = pt.aLead
     self.jLead = pt.jLead
     self.yvLead = pt.yvRel
-
-    if yaw_comp and abs(yaw_rate) < CORNER_YAW_COMP_MAX_YAW_RATE:
-      # Convert ego-frame velocities toward a non-rotating ego frame. This keeps
-      # corner radar cut-in prediction from treating ego yaw as target lateral motion.
-      yv_rel_corr = clamp(-yaw_rate * self.dRel * CORNER_YAW_COMP_GAIN,
-                          -CORNER_YAW_COMP_MAX_YVREL_CORRECTION,
-                          CORNER_YAW_COMP_MAX_YVREL_CORRECTION)
-      v_rel_corr = clamp(yaw_rate * self.yRel * CORNER_YAW_COMP_GAIN,
-                         -CORNER_YAW_COMP_MAX_VREL_CORRECTION,
-                         CORNER_YAW_COMP_MAX_VREL_CORRECTION)
-      self.yvLead = pt.yvRel + yv_rel_corr
-      self.vRel = pt.vRel + v_rel_corr
-      self.vLead = self.vLeadK = pt.vLead + v_rel_corr
 
     self.measured = pt.measured
     if not self.measured:
@@ -567,18 +553,6 @@ class RadarD:
     self.cornerLeadStopped = empty_lead()
     self.corner_tracks_available = False
 
-  def _corner_yaw_rate(self, sm: messaging.SubMaster) -> float:
-    if not sm.seen.get('livePose', False):
-      return 0.0
-
-    live_pose = sm['livePose']
-    yaw_rate = float(live_pose.angularVelocityDevice.z)
-    if not (live_pose.inputsOK and live_pose.sensorsOK and live_pose.angularVelocityDevice.valid):
-      return 0.0
-    if not np.isfinite(yaw_rate) or abs(yaw_rate) >= CORNER_YAW_COMP_MAX_YAW_RATE:
-      return 0.0
-    return yaw_rate
-
   def update(self, sm: messaging.SubMaster, rr: car.RadarData):
     self.ready = sm.seen['modelV2']
     self.current_time = 1e-9*max(sm.logMonoTime.values())
@@ -609,7 +583,6 @@ class RadarD:
       self.tracks.clear()
     else:
       valid_ids = set()
-      corner_yaw_rate = self._corner_yaw_rate(sm)
       for pt in rr.points:
         track_id = pt.trackId
         valid_ids.add(track_id)
@@ -617,12 +590,8 @@ class RadarD:
         if track_id not in self.tracks:
           self.tracks[track_id] = Track(track_id)
 
-        yaw_comp = (
-          CORNER_235_TRACK_ID_START <= track_id < CORNER_235_TRACK_ID_END or
-          CORNER_180_TRACK_ID_START <= track_id < CORNER_180_TRACK_ID_END
-        )
         self.tracks[track_id].update(sm['modelV2'], pt, self.ready, self.radar_reaction_factor,
-                                     self.radar_lat_factor, corner_yaw_rate, yaw_comp)
+                                     self.radar_lat_factor)
 
       for tid in list(self.tracks.keys()):
         if tid not in valid_ids:
@@ -754,16 +723,30 @@ class RadarD:
       self._corner_in_lane_ok(t, stopped=True, matched_front=matched_front)
     )
 
-  def _corner_lead_from_track(self, t: Track, model_prob: float = 0.0, vision_y_rel: float = 0.0) -> dict[str, Any]:
+  def _corner_track_accel_allowed(self, t: Track) -> bool:
+    return (
+      t.cnt >= CORNER_ACCEL_MIN_TRACK_AGE and
+      self._track_is_closer_than_lead_one(t) and
+      abs(t.dPath) < CORNER_ACCEL_MAX_ABS_DPATH and
+      math.isfinite(t.aLeadK) and
+      abs(t.aLeadK) < CORNER_ACCEL_MAX_ABS_ALEAD
+    )
+
+  def _corner_lead_from_track(self, t: Track, model_prob: float = 0.0, vision_y_rel: float = 0.0, use_accel: bool = True) -> dict[str, Any]:
     ld = t.get_RadarState(model_prob, vision_y_rel)
-    ld["aLead"] = 0.0
-    ld["aLeadK"] = 0.0
+    if use_accel and self._corner_track_accel_allowed(t):
+      a_lead = float(np.clip(t.aLeadK, -CORNER_ACCEL_MAX_ABS_ALEAD, CORNER_ACCEL_MAX_ABS_ALEAD))
+      ld["aLead"] = a_lead
+      ld["aLeadK"] = a_lead
+    else:
+      ld["aLead"] = 0.0
+      ld["aLeadK"] = 0.0
     ld["aLeadTau"] = _LEAD_ACCEL_TAU
     ld["jLead"] = 0.0
     return ld
 
   def _corner_stopped_lead_from_track(self, t: Track, lead_prob: float) -> dict[str, Any]:
-    ld = self._corner_lead_from_track(t, min(0.04, lead_prob), 0.0)
+    ld = self._corner_lead_from_track(t, min(0.04, lead_prob), 0.0, use_accel=False)
     ld["modelProb"] = 0.04
     ld["vLead"] = 0.0
     ld["vLeadK"] = 0.0
@@ -884,8 +867,27 @@ class RadarD:
       self.lead_one_front_radar_vision_match = True
     return lead_dict, radar
 
-  def _is_cutin_enter_candidate(self, t: Track) -> bool:
+  def _cutin_is_closer_or_matches_lead_one(self, t: Track, matched_front: bool = False) -> bool:
+    if self._track_is_closer_than_lead_one(t):
+      return True
+    if not matched_front:
+      return False
+
+    lead_one = self.radar_state.leadOne
+    if not lead_one.status or not lead_one.radar:
+      return False
+    if int(lead_one.radarTrackId) >= CORNER_235_TRACK_ID_START:
+      return False
+
+    return (
+      abs(t.dRel - float(lead_one.dRel)) < CORNER_FRONT_MATCH_DREL and
+      abs(t.vRel - float(lead_one.vRel)) < CORNER_FRONT_MATCH_VREL
+    )
+
+  def _is_cutin_enter_candidate(self, t: Track, matched_front: bool = False) -> bool:
     if not self.detect_cut_in or not self.lane_line_available or not self._is_corner_track(t):
+      return False
+    if not self._cutin_is_closer_or_matches_lead_one(t, matched_front):
       return False
     if t.cnt < self.cutin_min_track_age:
       return False
@@ -901,8 +903,10 @@ class RadarD:
       return False
     return True
 
-  def _is_cutin_keep_candidate(self, t: Track) -> bool:
+  def _is_cutin_keep_candidate(self, t: Track, matched_front: bool = False) -> bool:
     if not self.detect_cut_in or not self.lane_line_available or not self._is_corner_track(t):
+      return False
+    if not self._cutin_is_closer_or_matches_lead_one(t, matched_front):
       return False
     if not (2.5 < t.dRel < 55.0 and t.vLead > 2.0):
       return False
@@ -916,10 +920,10 @@ class RadarD:
       abs(t.dPath_future) < CUTIN_KEEP_MAX_DPATH_FUTURE
     )
 
-  def _update_cutin_sticky(self, t: Track) -> bool:
-    if self._is_cutin_enter_candidate(t):
+  def _update_cutin_sticky(self, t: Track, matched_front: bool = False) -> bool:
+    if self._is_cutin_enter_candidate(t, matched_front):
       t.cut_in_count = min(t.cut_in_count + 1, CUTIN_STICKY_FRAMES)
-    elif t.cut_in_count > 0 and self._is_cutin_keep_candidate(t):
+    elif t.cut_in_count > 0 and self._is_cutin_keep_candidate(t, matched_front):
       t.cut_in_count = max(t.cut_in_count - 1, 0)
     else:
       t.cut_in_count = 0
@@ -934,6 +938,18 @@ class RadarD:
       return False
 
     return cutin["dRel"] + CUTIN_PROMOTE_DREL_MARGIN < lead_one.dRel
+
+  def _track_is_closer_than_lead_one(self, t: Track) -> bool:
+    lead_one = self.radar_state.leadOne
+    if not lead_one.status:
+      return True
+    return t.dRel + CUTIN_PROMOTE_DREL_MARGIN < lead_one.dRel
+
+  def _lead_is_closer_than_lead_one(self, lead: dict[str, Any]) -> bool:
+    lead_one = self.radar_state.leadOne
+    if not lead_one.status:
+      return True
+    return lead["dRel"] + CUTIN_PROMOTE_DREL_MARGIN < lead_one.dRel
 
   def _corner_stopped_can_replace_lead_one(self, stopped: dict[str, Any]) -> bool:
     lead_one = self.radar_state.leadOne
@@ -966,6 +982,13 @@ class RadarD:
     if int(lead_one.radarTrackId) >= CORNER_235_TRACK_ID_START:
       return False
     return float(lead_one.modelProb) >= FRONT_RADAR_VISION_MATCH_MIN_PROB
+
+  def _lead_is_corner_track(self, lead: dict[str, Any]) -> bool:
+    track_id = int(lead.get("radarTrackId", -1))
+    return (
+      CORNER_235_TRACK_ID_START <= track_id < CORNER_235_TRACK_ID_END or
+      CORNER_180_TRACK_ID_START <= track_id < CORNER_180_TRACK_ID_END
+    )
 
   def _is_center_lead_candidate(self, t: Track) -> bool:
     in_lane_min = CENTER_LEAD_NEAR_IN_LANE_PROB
@@ -1034,7 +1057,7 @@ class RadarD:
         continue
       elif y_rel_neg < 0: #left_lane_y:
         ld = self._corner_lead_from_track(c, 0, 0) if is_corner else c.get_RadarState(0, 0)
-        if self._update_cutin_sticky(c):
+        if self._update_cutin_sticky(c, matching_front is not None):
           ld['modelProb'] = 0.03
           cutin_list.append(ld)
         if is_corner:
@@ -1043,7 +1066,7 @@ class RadarD:
           front_left_list.append(ld)
       else:
         ld = self._corner_lead_from_track(c, 0, 0) if is_corner else c.get_RadarState(0, 0)
-        if self._update_cutin_sticky(c):
+        if self._update_cutin_sticky(c, matching_front is not None):
           ld['modelProb'] = 0.03
           cutin_list.append(ld)
         if is_corner:
@@ -1081,7 +1104,7 @@ class RadarD:
       )
       if self.radar_state.leadOne.status and self.radar_state.leadOne.radar:
         self.leadTwo = min(
-            (ld for ld in center_list if ld['vLead'] > 5 and ld['radar'] and self.radar_state.leadOne.dRel < ld['dRel'] < 80),
+            (ld for ld in center_list if ld['vLead'] > 5 and ld['radar'] and not self._lead_is_corner_track(ld) and self.radar_state.leadOne.dRel < ld['dRel'] < 80),
             key=lambda d: d['dRel'],
             default=None
         )
@@ -1123,13 +1146,9 @@ class RadarD:
     chosen = None
     detected = self.radar_detected
 
-    if self.cornerLeadStopped and self.cornerLeadStopped.get("status"):
-      if self._corner_stopped_can_replace_lead_one(self.cornerLeadStopped):
-        chosen = self.cornerLeadStopped
-        chosen["modelProb"] = 0.04
-        detected = True
-
-    elif self.leadCenter and self.leadCenter["status"] and is_radar_center_promotion_safe(self.leadCenter):
+    if (self.leadCenter and self.leadCenter["status"] and
+        not self._lead_is_corner_track(self.leadCenter) and
+        is_radar_center_promotion_safe(self.leadCenter)):
       lead_one = self.radar_state.leadOne
       vision_prob = lead_one.modelProb if lead_one.status else 0.0
 

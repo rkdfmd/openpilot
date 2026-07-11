@@ -14,11 +14,13 @@ from pathlib import Path
 from cluster_config import (
     CLUSTER_BRIGHTNESS_PARAM,
     CLUSTER_CAMERA_VIEW_MODE_PARAM,
+    CLUSTER_CAMERA_VIEW_MODE_ROAD_CAMERA,
     CLUSTER_ENCODER_AUTO,
     CLUSTER_ENCODER_HARDWARE,
     CLUSTER_ENCODER_JPEG,
     CLUSTER_ENCODER_PARAM,
     CLUSTER_ENCODER_SOFTWARE,
+    CLUSTER_HUD_MIRROR_PARAM,
     CLUSTER_CORE_MODE_PARAM,
     CLUSTER_HUD_DEBUG_PARAM,
     CLUSTER_HUD_PARAM,
@@ -273,6 +275,23 @@ class ClusterHudBrightnessParamReader:
         except Exception:
             return 0
 
+class ClusterHudMirrorParamReader:
+    def __init__(self) -> None:
+        self._params = None
+        try:
+            from openpilot.common.params import Params
+
+            self._params = Params()
+        except Exception:
+            pass
+
+    def read(self) -> int:
+        if self._params is None:
+            return 0
+        try:
+            return max(0, min(3, self._params.get_int(CLUSTER_HUD_MIRROR_PARAM)))
+        except Exception:
+            return 0
 
 class ClusterScreenModeParamReader:
     def __init__(self) -> None:
@@ -487,12 +506,19 @@ class ClusterHudPriorityParamReader:
             return None
 
 
-def route_overlay_for_mode(overlay: RouteOverlay | None, mode: str) -> RouteOverlay | None:
+def route_overlay_for_mode(
+    overlay: RouteOverlay | None,
+    mode: str,
+    *,
+    keep_video: bool = False,
+) -> RouteOverlay | None:
     if overlay is None or mode == "off":
+        if overlay is not None and keep_video:
+            return replace(overlay, panel_visible=False, data_lines=())
         return None
     if mode == "compact":
-        return replace(overlay, data_lines=overlay.data_lines[:4])
-    return overlay
+        return replace(overlay, panel_visible=True, data_lines=overlay.data_lines[:4])
+    return replace(overlay, panel_visible=True)
 
 
 def resolved_usb_brightness(
@@ -580,6 +606,7 @@ def run_demo(
     route_path: Path,
     route_log: str,
     route_overlay_mode: str,
+    camera_view_mode: int | None,
     route_loop: bool,
     route_replay_speed: float,
     route_start_segment: int | None,
@@ -623,6 +650,10 @@ def run_demo(
     usb_pipeline: AsyncJpegUsbPipeline | None = None
     h264_pipeline: H264UsbPipeline | None = None
     active_brightness_setting = normalize_cluster_brightness_percent(usb_brightness)
+
+    hud_mirror_param_reader = ClusterHudMirrorParamReader()
+    active_hud_mirror_mode = hud_mirror_param_reader.read()
+
     usb_brightness_auto_enabled = usb_brightness_param_reader is not None
     initial_usb_brightness = resolved_usb_brightness(
         active_brightness_setting,
@@ -685,8 +716,17 @@ def run_demo(
     active_theme_mode = theme_override or (theme_param_reader.read() if theme_param_reader is not None else "auto")
     screen_mode_param_reader = ClusterScreenModeParamReader()
     active_screen_mode = screen_mode_param_reader.read()
-    camera_view_param_reader = ClusterCameraViewModeParamReader()
-    active_camera_view_mode = camera_view_param_reader.read()
+    camera_view_override = (
+        normalize_cluster_camera_view_mode(camera_view_mode)
+        if camera_view_mode is not None
+        else None
+    )
+    camera_view_param_reader = ClusterCameraViewModeParamReader() if camera_view_override is None else None
+    active_camera_view_mode = (
+        camera_view_override
+        if camera_view_override is not None
+        else camera_view_param_reader.read()
+    )
     radar_info_param_reader = ClusterRadarInfoParamReader()
     active_radar_info_mode = radar_info_param_reader.read()
     radar_display_param_reader = ClusterRadarDisplayParamReader()
@@ -738,7 +778,15 @@ def run_demo(
     route_source = None
     if input_mode == "route":
         profile_stage = time.perf_counter()
-        route_source = RouteReplaySource.load(route_path, route_log, route_start_segment, route_max_segments)
+        route_source = RouteReplaySource.load(
+            route_path,
+            route_log,
+            route_start_segment,
+            route_max_segments,
+            0.0,
+            "live",
+            0.0,
+        )
         profile.add_elapsed("source.route_load_initial", profile_stage)
     if route_source is not None:
         print(
@@ -747,6 +795,11 @@ def run_demo(
             f"{route_source.loaded_file_count}/{len(route_source.source_files)} {route_log} files"
         )
     start_time = time.perf_counter()
+    route_wall_base_time = start_time
+    route_playback_base_s = 0.0
+    route_paused = False
+    route_pause_toggled_down = False
+    route_active_corner_lateral_offset_m = 0.0
     last_frame_time = start_time
     last_report_time = start_time
     next_theme_param_read = start_time
@@ -863,6 +916,16 @@ def run_demo(
                 break
 
             now = time.perf_counter()
+
+            next_hud_mirror_mode = hud_mirror_param_reader.read()
+            if next_hud_mirror_mode != active_hud_mirror_mode:
+                print(
+                    f"{CLUSTER_HUD_MIRROR_PARAM} updated: "
+                    f"{active_hud_mirror_mode} -> {next_hud_mirror_mode}",
+                    flush=True,
+                )
+                active_hud_mirror_mode = next_hud_mirror_mode
+
             if theme_override is None and now >= next_theme_param_read:
                 next_theme_mode = theme_param_reader.read() if theme_param_reader is not None else "auto"
                 if next_theme_mode != renderer.theme_mode:
@@ -884,14 +947,15 @@ def run_demo(
                         )
                 next_screen_mode_param_read = now + SCREEN_MODE_PARAM_POLL_SECONDS
             if now >= next_camera_view_param_read:
-                next_camera_view_mode = camera_view_param_reader.read()
-                if next_camera_view_mode != active_camera_view_mode:
-                    print(
-                        f"{CLUSTER_CAMERA_VIEW_MODE_PARAM} updated: "
-                        f"{active_camera_view_mode} -> {next_camera_view_mode}",
-                        flush=True,
-                    )
-                    active_camera_view_mode = next_camera_view_mode
+                if camera_view_param_reader is not None:
+                    next_camera_view_mode = camera_view_param_reader.read()
+                    if next_camera_view_mode != active_camera_view_mode:
+                        print(
+                            f"{CLUSTER_CAMERA_VIEW_MODE_PARAM} updated: "
+                            f"{active_camera_view_mode} -> {next_camera_view_mode}",
+                            flush=True,
+                        )
+                        active_camera_view_mode = next_camera_view_mode
                 next_camera_view_param_read = now + CAMERA_VIEW_PARAM_POLL_SECONDS
             if now >= next_radar_param_read:
                 next_radar_info_mode = radar_info_param_reader.read()
@@ -1027,15 +1091,51 @@ def run_demo(
                 profile.add_elapsed("source.live_update", profile_stage)
             elif route_source is not None:
                 profile_stage = time.perf_counter()
-                playback_seconds = (now - start_time) * route_replay_speed
+                playback_seconds = (
+                    route_playback_base_s
+                    if route_paused
+                    else route_playback_base_s + (now - route_wall_base_time) * route_replay_speed
+                )
+                if output_mode in ("window", "both"):
+                    seek_s, next_corner_lateral_offset_m, _control_active = renderer.route_replay_control_input(
+                        playback_seconds,
+                        route_source.duration,
+                        route_active_corner_lateral_offset_m,
+                    )
+                    mouse_down = renderer.route_replay_mouse_down()
+                    if mouse_down and not _control_active and not route_pause_toggled_down:
+                        route_paused = not route_paused
+                        route_playback_base_s = playback_seconds
+                        route_wall_base_time = now
+                    route_pause_toggled_down = mouse_down
+                    if seek_s is not None:
+                        route_playback_base_s = seek_s
+                        route_wall_base_time = now
+                        playback_seconds = seek_s
+                        route_paused = True
+                    if next_corner_lateral_offset_m != route_active_corner_lateral_offset_m:
+                        route_active_corner_lateral_offset_m = next_corner_lateral_offset_m
+                        route_source.corner_lateral_offset_m = route_active_corner_lateral_offset_m
+                        route_paused = True
+                        route_playback_base_s = playback_seconds
+                        route_wall_base_time = now
                 if route_source.is_finished(playback_seconds, route_loop):
                     break
+                route_source.corner_lateral_offset_m = route_active_corner_lateral_offset_m
+                keep_camera_video = active_camera_view_mode == CLUSTER_CAMERA_VIEW_MODE_ROAD_CAMERA
                 state = route_source.state_at(
                     playback_seconds,
                     route_loop,
-                    include_overlay=route_overlay_mode != "off",
+                    include_overlay=route_overlay_mode != "off" or keep_camera_video,
                 )
-                state = replace(state, route_overlay=route_overlay_for_mode(state.route_overlay, route_overlay_mode))
+                state = replace(
+                    state,
+                    route_overlay=route_overlay_for_mode(
+                        state.route_overlay,
+                        route_overlay_mode,
+                        keep_video=keep_camera_video,
+                    ),
+                )
                 source_status = route_source.status_text(playback_seconds, route_loop)
                 profile.add_elapsed("source.route_update", profile_stage)
             elif controller is None:
@@ -1102,7 +1202,16 @@ def run_demo(
 
             if output_mode in ("window", "both"):
                 profile_stage = time.perf_counter()
-                renderer.render_frame(state)
+                if route_source is not None:
+                    renderer.render_route_replay_frame(
+                        state,
+                        playback_seconds,
+                        route_source.duration,
+                        route_active_corner_lateral_offset_m,
+                        route_paused,
+                    )
+                else:
+                    renderer.render_frame(state)
                 profile.add_elapsed("main.window_render_total", profile_stage)
             if usb_display is not None:
                 if usb_codec == "jpeg":
@@ -1157,7 +1266,7 @@ def run_demo(
                                 uv_offset,
                                 render_bytes,
                                 h264_render_nv12_buffer,
-                                flip_x=True,
+                                flip_x=not bool(active_hud_mirror_mode & 1),
                             ) as h264_render_nv12_frame:
                                 profile.add_elapsed("main.usb.render_nv12_total", profile_stage)
                                 if isinstance(h264_render_nv12_frame, bytearray):
@@ -1571,6 +1680,13 @@ def parse_args() -> argparse.Namespace:
         help="Route replay debug overlay. Default compact shows the replay camera/data panel; use off for performance tests.",
     )
     parser.add_argument(
+        "--camera-view-mode",
+        type=int,
+        choices=(0, 1, 2),
+        default=None,
+        help=f"Camera view override. Default reads {CLUSTER_CAMERA_VIEW_MODE_PARAM}; mode 2 is camera.",
+    )
+    parser.add_argument(
         "--theme",
         choices=("auto", "dark", "light"),
         default=None,
@@ -1627,8 +1743,14 @@ def parse_args() -> argparse.Namespace:
         "--live-no-can",
         action="store_true",
         help=(
-            "Disable live CAN/sendcan subscriptions. This keeps radarState/modelV2/liveTracks data "
-            "but skips direct raw CAN parsing for camera-bus ADAS corner detections."
+            "Keep live CAN/sendcan subscriptions disabled. This is the default for the in-car HUD."
+        ),
+    )
+    parser.add_argument(
+        "--live-include-can",
+        action="store_true",
+        help=(
+            "Enable live CAN/sendcan subscriptions for PC/debug runs. This adds raw CAN parsing load."
         ),
     )
     parser.add_argument(
@@ -1855,11 +1977,12 @@ def main(*, exit_on_error: bool = True) -> None:
             args.route,
             args.route_log,
             args.route_overlay,
+            args.camera_view_mode,
             args.route_loop,
             args.route_replay_speed,
             args.route_start_segment,
             args.route_max_segments,
-            not args.live_no_can,
+            bool(args.live_include_can and not args.live_no_can),
             args.live_timeout_ms,
             not args.no_cluster_core_usage,
             args.cluster_core_usage_debug,

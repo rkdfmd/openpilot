@@ -8,11 +8,15 @@
     ownerWs: null,
     reconnectTimer: 0,
     startPollTimer: 0,
+    busyAction: "",
     pending: new Map(),
     snapshot: { active: false, state: "idle" },
     typingActive: false,
     typingText: "",
     typingTimer: 0,
+    typingRenderRaf: 0,
+    rawTypingBuffer: "",
+    rawTypingTimer: 0,
     remainingTimer: 0,
     remainingDeadlineMs: 0,
     initialized: false,
@@ -20,6 +24,8 @@
     issueDraft: "",
     settings: {
       ttlSeconds: 1800,
+      // Default to confirm-each-command; the persisted web setting (seeded in
+      // init) overrides this, and the server default matches.
       permissionMode: "approve_each",
       commandTimeoutSeconds: 30,
     },
@@ -38,7 +44,8 @@
     if (state.initialized) return;
     state.initialized = true;
     els.open = $("btnSupportTerminalOpen");
-    els.form = $("terminalForm");
+    els.approvalHost = $("supportTerminalApprovalHost");
+    els.typingHost = $("supportTerminalTypingHost");
     if (els.open) els.open.addEventListener("click", openSupportDialog);
     ensureApprovalHost();
   }
@@ -191,9 +198,17 @@
     const issueInput = $("supportTerminalIssue");
     state.issueDraft = issueInput?.value || state.issueDraft || "";
     state.busy = true;
-    renderToolbarButton();
-    renderApprovalHost();
-    renderDialog();
+    state.busyAction = "start";
+    applySnapshot({
+      ok: true,
+      active: true,
+      state: "starting",
+      ttl_seconds: state.settings.ttlSeconds,
+      permission_mode: state.settings.permissionMode,
+      command_timeout_seconds: state.settings.commandTimeoutSeconds,
+      guest_count: 0,
+      pending_commands: [],
+    });
     startStatusPolling();
     try {
       const snapshot = await postJson("/api/support_terminal/start", {
@@ -202,25 +217,33 @@
         permission_mode: state.settings.permissionMode,
         command_timeout_seconds: state.settings.commandTimeoutSeconds,
       });
-      applySnapshot(snapshot);
+      if (state.busyAction === "start") applySnapshot(snapshot);
       scheduleStatusRefresh(350);
       scheduleStatusRefresh(1200);
-      toast(t("support_terminal_started", "Remote support started"));
+      if (state.busyAction === "start" && snapshot?.active) toast(t("support_terminal_started", "Remote support started"));
     } catch (err) {
-      state.snapshot = { ...(state.snapshot || {}), error: err?.message || "start failed" };
-      renderDialog();
-      toast(err?.message || t("support_terminal_start_failed", "Remote support start failed"), { tone: "error", duration: 4200 });
+      if (state.busyAction === "start") {
+        state.snapshot = { ...(state.snapshot || {}), error: err?.message || "start failed" };
+        renderDialog();
+        toast(err?.message || t("support_terminal_start_failed", "Remote support start failed"), { tone: "error", duration: 4200 });
+      } else {
+        scheduleStatusRefresh(350);
+      }
     } finally {
-      clearStartPollTimer();
-      state.busy = false;
-      renderToolbarButton();
-      renderDialog();
+      if (state.busyAction === "start") {
+        clearStartPollTimer();
+        state.busy = false;
+        state.busyAction = "";
+        renderToolbarButton();
+        renderDialog();
+      }
     }
   }
 
   async function stopSession() {
-    if (state.busy) return;
+    if (state.busy && state.busyAction !== "start") return;
     state.busy = true;
+    state.busyAction = "stop";
     applySnapshot({ ok: true, active: false, state: "stopping" });
     state.issueDraft = "";
     try {
@@ -232,9 +255,13 @@
       await loadStatus({ quiet: true });
       toast(err?.message || t("support_terminal_stop_failed", "Stop failed"), { tone: "error" });
     } finally {
-      state.busy = false;
-      renderToolbarButton();
-      renderDialog();
+      if (state.busyAction === "stop") {
+        clearStartPollTimer();
+        state.busy = false;
+        state.busyAction = "";
+        renderToolbarButton();
+        renderDialog();
+      }
     }
   }
 
@@ -326,6 +353,9 @@
     const wasActive = state.active;
     state.snapshot = snapshot || { active: false, state: "idle" };
     state.active = Boolean(snapshot?.active);
+    try {
+      window.dispatchEvent(new CustomEvent("carrot:support-terminal-status", { detail: state.snapshot }));
+    } catch (err) {}
     if (snapshot?.ttl_seconds != null) state.settings.ttlSeconds = Number(snapshot.ttl_seconds);
     if (snapshot?.permission_mode) state.settings.permissionMode = String(snapshot.permission_mode);
     if (snapshot?.command_timeout_seconds != null) state.settings.commandTimeoutSeconds = Number(snapshot.command_timeout_seconds);
@@ -366,14 +396,21 @@
 
   function ensureApprovalHost() {
     if (els.approvalHost && document.body.contains(els.approvalHost)) return els.approvalHost;
-    const form = els.form || $("terminalForm");
-    if (!form || !form.parentNode) return null;
-    const host = document.createElement("div");
-    host.id = "supportTerminalApprovalHost";
-    host.className = "terminal-approval-host";
-    host.hidden = true;
-    form.parentNode.insertBefore(host, form);
+    const host = $("supportTerminalApprovalHost");
+    if (!host) return null;
     els.approvalHost = host;
+    return host;
+  }
+
+  function ensureTypingHost() {
+    const host = els.typingHost || $("supportTerminalTypingHost");
+    const terminal = $("terminalXterm");
+    if (!host || !terminal) return null;
+    els.typingHost = host;
+    // xterm is opened before support input can arrive. Mount inside it so this
+    // visual-only presence indicator is positioned over the grid, not in the
+    // terminal shell's flex layout.
+    if (terminal.querySelector(".xterm") && host.parentElement !== terminal) terminal.append(host);
     return host;
   }
 
@@ -381,25 +418,12 @@
     const host = ensureApprovalHost();
     if (!host) return;
     const commands = Array.from(state.pending.values());
-    const guestCount = Number(state.snapshot?.guest_count || 0);
-    if (!commands.length && !state.typingActive) {
+    if (!commands.length) {
       host.hidden = true;
       host.innerHTML = "";
       return;
     }
     host.hidden = false;
-    if (!commands.length) {
-      const typingText = state.typingText.trim();
-      host.innerHTML = `
-        <div class="terminal-approval terminal-approval--status">
-          <div class="terminal-approval__meta">${escapeHtml(t("support_terminal_guest_count", "Guest {count}", { count: guestCount }))}</div>
-          <div class="terminal-approval__line">
-            ${typingText ? `<span class="terminal-approval__typingLabel">${escapeHtml(t("support_terminal_guest_draft", "Guest input"))}</span><code class="terminal-approval__draft">${escapeHtml(typingText)}</code>` : escapeHtml(t("support_terminal_guest_typing", "Guest typing..."))}
-          </div>
-        </div>
-      `;
-      return;
-    }
     host.innerHTML = commands.map((command) => `
       <div class="terminal-approval" data-support-command-id="${escapeHtml(command.id)}">
         <div class="terminal-approval__meta">${escapeHtml(t("support_terminal_command_approval", "Command approval"))}</div>
@@ -459,6 +483,13 @@
     const pendingCount = state.pending.size;
     if (error) return error;
     if (!active) return state.busy ? busyLabel() : localizeState(stateText);
+    if (stateText === "starting") return detail ? localizeStatusDetail(detail) : t("support_terminal_starting", "Starting...");
+    if ([
+      "Secure tunnel ready",
+      "Sending Carrot server notification",
+    ].includes(detail)) {
+      return localizeStatusDetail(detail);
+    }
     const time = remaining == null ? t("support_terminal_time_unlimited", "Unlimited") : formatRemaining(remaining);
     if (pendingCount > 0) {
       return t("support_terminal_status_command_pending", "Command pending {time} - {count} approval", { time, count: pendingCount });
@@ -473,11 +504,11 @@
   }
 
   function discordLabel(discord) {
-    if (!discord || discord.configured === false) return t("support_terminal_discord_not_sent", "Discord not sent");
-    if (discord.disabled) return t("support_terminal_discord_disabled", "Discord disabled");
-    if (discord.ok) return t("support_terminal_discord_sent", "Discord sent");
-    if (discord.error) return t("support_terminal_discord_error", "Discord error");
-    return t("support_terminal_discord_pending", "Discord pending");
+    if (!discord || discord.configured === false) return t("support_terminal_discord_not_sent", "Notification not sent");
+    if (discord.disabled) return t("support_terminal_discord_disabled", "Notification disabled");
+    if (discord.ok) return t("support_terminal_discord_sent", "Notification sent");
+    if (discord.error) return t("support_terminal_discord_error", "Notification error");
+    return t("support_terminal_discord_pending", "Notification pending");
   }
 
   function localizeState(value) {
@@ -498,12 +529,13 @@
   function localizeStatusDetail(value) {
     const map = {
       "Preparing terminal session": ["support_terminal_detail_preparing", "Preparing terminal session"],
+      "Preparing shared terminal session": ["support_terminal_detail_preparing", "Preparing shared terminal session"],
       "Starting support page": ["support_terminal_detail_page", "Starting support page"],
       "Downloading cloudflared": ["support_terminal_detail_downloading", "Downloading cloudflared"],
       "Starting secure tunnel": ["support_terminal_detail_tunnel", "Starting secure tunnel"],
       "cloudflared unavailable": ["support_terminal_detail_unavailable", "cloudflared unavailable"],
       "Secure tunnel ready": ["support_terminal_detail_tunnel_ready", "Secure tunnel ready"],
-      "Sending Discord message": ["support_terminal_detail_discord", "Sending Discord message"],
+      "Sending Carrot server notification": ["support_terminal_detail_discord", "Sending Carrot server notification"],
       "Ready": ["support_terminal_detail_ready", "Ready"],
       "Start failed": ["support_terminal_detail_failed", "Start failed"],
     };
@@ -517,7 +549,7 @@
     const status = supportStatusLabel();
     const issueDisabled = state.busy || active ? "disabled" : "";
     const startDisabled = state.busy || active ? "disabled" : "";
-    const stopDisabled = state.busy || !active ? "disabled" : "";
+    const stopDisabled = (state.busy && state.busyAction !== "start") || !active ? "disabled" : "";
     const actionButton = active
       ? `<button id="btnSupportTerminalStop" class="smallBtn" type="button" ${stopDisabled}>${escapeHtml(t("support_terminal_stop", "Stop"))}</button>`
       : `<button id="btnSupportTerminalStart" class="smallBtn btn--filled" type="button" ${startDisabled}>${escapeHtml(state.busy ? busyLabel() : t("support_terminal_start", "Start"))}</button>`;
@@ -617,14 +649,40 @@
     });
   }
 
+  // Persist a support setting to the server-side web settings store so the
+  // owner's last choice survives reloads. Fire-and-forget; a failed write just
+  // keeps the in-memory value for this session.
+  function persistSetting(key, value) {
+    try {
+      const result = window.setWebSettingByKey?.(key, value);
+      if (result && typeof result.catch === "function") result.catch(() => {});
+    } catch (err) {}
+  }
+
+  // Read persisted support settings (seeded from bootstrap by the web settings
+  // state module) into local state. Called on init so the dialog opens with the
+  // owner's last choices instead of the hardcoded defaults.
+  function seedPersistedSettings() {
+    if (typeof window.getWebSettingByKey !== "function") return;
+    const permission = String(window.getWebSettingByKey("support_permission_mode", "approve_each") || "approve_each");
+    state.settings.permissionMode = permission === "allow_all" ? "allow_all" : "approve_each";
+    const ttl = Number(window.getWebSettingByKey("support_ttl_seconds", 1800));
+    if (TTL_OPTIONS.includes(ttl)) state.settings.ttlSeconds = ttl;
+    const timeout = Number(window.getWebSettingByKey("support_command_timeout_seconds", 30));
+    if (COMMAND_TIMEOUT_OPTIONS.includes(timeout)) state.settings.commandTimeoutSeconds = timeout;
+  }
+
   function updateSetting(kind, rawValue) {
     if (state.busy || state.active) return;
     if (kind === "ttl") {
       state.settings.ttlSeconds = Number(rawValue);
+      persistSetting("support_ttl_seconds", String(state.settings.ttlSeconds));
     } else if (kind === "permission") {
       state.settings.permissionMode = rawValue === "allow_all" ? "allow_all" : "approve_each";
+      persistSetting("support_permission_mode", state.settings.permissionMode);
     } else if (kind === "timeout") {
       state.settings.commandTimeoutSeconds = Number(rawValue);
+      persistSetting("support_command_timeout_seconds", String(state.settings.commandTimeoutSeconds));
     }
     renderDialog();
   }
@@ -669,11 +727,117 @@
       state.typingTimer = window.setTimeout(() => {
         state.typingActive = false;
         state.typingText = "";
-        renderDialog();
+        scheduleTypingRender();
       }, 2200);
     }
-    renderDialog();
-    renderApprovalHost();
+    scheduleTypingRender();
+  }
+
+  function scheduleTypingRender() {
+    if (state.typingRenderRaf) return;
+    state.typingRenderRaf = requestAnimationFrame(() => {
+      state.typingRenderRaf = 0;
+      renderTypingOverlay();
+    });
+  }
+
+  function applyPrintableTypingInput(buffer, data) {
+    let next = String(buffer || "");
+    let changed = false;
+    let submitted = false;
+    const input = String(data || "");
+
+    for (let index = 0; index < input.length; index += 1) {
+      const char = input[index];
+      if (char === "\x1b") {
+        const kind = input[index + 1];
+        if (kind === "[") {
+          index += 2;
+          while (index < input.length) {
+            const code = input.charCodeAt(index);
+            if (code >= 0x40 && code <= 0x7e) break;
+            index += 1;
+          }
+        } else if (kind === "]") {
+          index += 2;
+          while (index < input.length) {
+            if (input[index] === "\x07") break;
+            if (input[index] === "\x1b" && input[index + 1] === "\\") {
+              index += 1;
+              break;
+            }
+            index += 1;
+          }
+        } else {
+          index += 1;
+        }
+        continue;
+      }
+      if (char === "\r" || char === "\n") {
+        if (next) changed = true;
+        next = "";
+        submitted = true;
+        continue;
+      }
+      if (char === "\x7f" || char === "\b") {
+        const trimmed = next.slice(0, -1);
+        changed ||= trimmed !== next;
+        next = trimmed;
+        continue;
+      }
+      if (char >= " " && char !== "\x7f") {
+        next = (next + char).slice(-160);
+        changed = true;
+      }
+    }
+    return { text: next, changed, submitted };
+  }
+
+  function reportHostRawTyping(data) {
+    if (!state.active || state.snapshot?.permission_mode !== "allow_all") return;
+    const result = applyPrintableTypingInput(state.rawTypingBuffer, data);
+    state.rawTypingBuffer = result.text;
+    if (state.rawTypingTimer) clearTimeout(state.rawTypingTimer);
+    if (result.submitted) {
+      state.rawTypingTimer = 0;
+      if (state.ownerWs?.readyState === WebSocket.OPEN) state.ownerWs.send(JSON.stringify({ type: "typing", active: false, text: "" }));
+      return;
+    }
+    if (!result.changed && !state.rawTypingBuffer) return;
+    if (state.ownerWs?.readyState !== WebSocket.OPEN) return;
+    state.ownerWs.send(JSON.stringify({ type: "typing", active: true, text: state.rawTypingBuffer }));
+    state.rawTypingTimer = window.setTimeout(() => {
+      state.rawTypingTimer = 0;
+      if (state.ownerWs?.readyState === WebSocket.OPEN) state.ownerWs.send(JSON.stringify({ type: "typing", active: false, text: "" }));
+    }, 1400);
+  }
+
+  function renderTypingOverlay() {
+    const host = ensureTypingHost();
+    if (!host) return;
+    const active = state.typingActive;
+    document.documentElement.style.setProperty("--terminal-collab-toast-offset", active ? "46px" : "0px");
+    host.classList.toggle("is-visible", active);
+    host.setAttribute("aria-hidden", active ? "false" : "true");
+    if (!active) return;
+
+    let indicator = host.querySelector(".terminal-typing-indicator");
+    if (!indicator) {
+      indicator = document.createElement("div");
+      indicator.className = "terminal-typing-indicator";
+      const meta = document.createElement("span");
+      meta.className = "terminal-typing-indicator__meta";
+      const label = document.createElement("span");
+      label.className = "terminal-typing-indicator__label";
+      const draft = document.createElement("code");
+      draft.className = "terminal-typing-indicator__draft";
+      indicator.append(meta, label, draft);
+      host.append(indicator);
+    }
+    const guestCount = Number(state.snapshot?.guest_count || 0);
+    indicator.querySelector(".terminal-typing-indicator__meta").textContent = t("support_terminal_guest_count", "Guest {count}", { count: guestCount });
+    indicator.querySelector(".terminal-typing-indicator__label").textContent = t("support_terminal_guest_draft", "Guest input");
+    indicator.querySelector(".terminal-typing-indicator__draft").textContent = state.typingText.trim() || t("support_terminal_guest_typing", "Guest typing...");
   }
 
   function activeRemainingSeconds() {
@@ -694,6 +858,7 @@
   function init() {
     state.pageActive = true;
     bindElements();
+    seedPersistedSettings();
     loadStatus({ quiet: true });
   }
 
@@ -701,6 +866,7 @@
     state.pageActive = false;
     state.dialogOpen = false;
     document.body.classList.remove("support-terminal-dialog-open");
+    document.documentElement.style.removeProperty("--terminal-collab-toast-offset");
     showTyping(false);
     clearStartPollTimer();
     clearRemainingTimer();
@@ -712,5 +878,6 @@
     teardown,
     refresh: loadStatus,
     open: openSupportDialog,
+    reportHostRawTyping,
   };
 })();
