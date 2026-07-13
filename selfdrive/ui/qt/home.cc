@@ -352,7 +352,7 @@ void HomeWindow::updateState(const UIState &s) {
       break;
   }
 
-  // Auto-Tuner: 주행 중 주차(P단) 전환 시 즉시 팝업 표시 또는 자동 적용 (1초 주기로 체크)
+  // Auto-Tuner: 주행 중 주차(P단) 전환 시 팝업으로 확인 후 적용 (자동적용 없음, 1초 주기로 체크)
   static int carrot_tuner_frame = 0;
   if (carrot_tuner_frame++ % 20 == 0) {
     Params params;
@@ -364,46 +364,12 @@ void HomeWindow::updateState(const UIState &s) {
       QJsonDocument doc = QJsonDocument::fromJson(raw.toUtf8());
       if (!raw.isEmpty() && doc.isObject()) {
         QJsonObject obj = doc.object();
-        bool auto_apply = params.getBool("CarrotLearningAutoApply");
-        
-        if (auto_apply) {
-          // ── [A] 자동 적용 (Auto Apply) ──────────────────────────────────────
-          // 추천사항의 모든 파라미터 적용
-          for (const QString& group : obj.keys()) {
-            QJsonObject group_items = obj[group].toObject();
-            for (const QString& key : group_items.keys()) {
-              QJsonObject info = group_items[key].toObject();
-              // 엔진이 이미 안전 범위로 클램프함. StoppingAccel 등 음수/0 추천도
-              // 적용되도록 양수 가드 대신 키 존재 여부로 판정.
-              if (info.contains("recommended")) {
-                int recommended = info["recommended"].toInt(0);
-                params.put(key.toStdString(), std::to_string(recommended));
-              }
-            }
-          }
-          
-          // history_array에 이력 저장
-          QJsonArray history_array;
-          QString history_raw = QString::fromStdString(params.get("CarrotLearningHistory"));
-          if (!history_raw.isEmpty()) {
-            QJsonDocument h_doc = QJsonDocument::fromJson(history_raw.toUtf8());
-            if (h_doc.isArray()) history_array = h_doc.array();
-          }
 
-          QJsonObject history_entry;
-          history_entry["timestamp"] = QDateTime::currentDateTime().toString("yyyy-MM-dd HH:mm");
-          history_entry["changes"] = obj;
-          history_entry["id"] = QString::number(QDateTime::currentMSecsSinceEpoch());
-          
-          history_array.prepend(history_entry);
-          while (history_array.size() > 50) history_array.removeLast();
-
-          params.put("CarrotLearningHistory", QJsonDocument(history_array).toJson(QJsonDocument::Compact).toStdString());
-          
-          // 학습 데이터 클리어 신호
-          params.putBool("CarrotLearningClear", true);
-        } else {
-          // ── [B] 수동 적용 (Manual Apply) ─────────────────────────────────────
+        // 자동 적용(Auto Apply) 없이 항상 수동 확인 팝업으로만 진행.
+        // (주차할 때마다 파라미터가 자동으로 바뀌는 걸 방지 — 사용자가 팝업에서
+        //  직접 항목을 골라 확인해야만 적용된다.)
+        {
+          // ── 수동 적용 (Manual Apply) ─────────────────────────────────────
           QString msg = tr("Auto-Tuner: Driving pattern learned!");
           AutoTunerDialog *dialog = new AutoTunerDialog(msg, obj, this);
           connect(dialog, &QDialog::accepted, [=]() {
