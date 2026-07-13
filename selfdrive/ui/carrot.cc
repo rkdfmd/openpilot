@@ -2490,7 +2490,8 @@ public:
             NVGcolor limit_color = COLOR_GREEN_ALPHA(210);
             if (xSpdLimit > 0 && xSignType != 22) {
                 disp_speed = (int)(xSpdLimit * ((s->scene.is_metric)?1:KM_TO_MILE) + 0.5);
-                limit_color = (blink_timer <= 8) ? COLOR_RED_ALPHA(210) : COLOR_YELLOW_ALPHA(210);
+                //limit_color = (blink_timer <= 8) ? COLOR_RED_ALPHA(210) : COLOR_YELLOW_ALPHA(210); //문제시 원복
+                limit_color = COLOR_YELLOW_ALPHA(210);
                 ui_draw_text(s, dx, dy-45, "CAM", 30, COLOR_WHITE, BOLD);
             }
             else {
