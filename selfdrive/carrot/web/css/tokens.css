@@ -28,6 +28,22 @@
   --md-error-cont:     #93000a;
   --md-on-error-cont:  #ffdad6;
 
+  /* ── Success / Warning (added for Auto-Tuner page) ── */
+  --md-success:        #8fdc9b;
+  --md-success-strong: #4fd18b;
+  --md-success-cont:   color-mix(in srgb, var(--md-success) 16%, var(--md-surface-cont-h));
+  --md-on-success-cont: color-mix(in srgb, var(--md-success) 78%, var(--md-on-surface));
+
+  --md-warning:        #ffc94a;
+  --md-warning-strong: #ffb000;
+  --md-warning-cont:   color-mix(in srgb, var(--md-warning) 18%, var(--md-surface-cont-h));
+  --md-on-warning-cont: color-mix(in srgb, var(--md-warning) 78%, var(--md-on-surface));
+
+  /* ── Primary state (added for Auto-Tuner page) ── */
+  --md-primary-state-soft:   color-mix(in srgb, var(--md-primary) 14%, transparent);
+  --md-primary-state:        color-mix(in srgb, var(--md-primary) 18%, var(--md-surface-cont-h));
+  --md-primary-state-strong: color-mix(in srgb, var(--md-primary) 22%, var(--md-surface-cont-hh));
+
   /* ── Spacing ── */
   --sp-xs:   4px;
   --sp-sm:   8px;

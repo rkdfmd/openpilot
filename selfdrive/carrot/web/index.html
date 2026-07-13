@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="/css/tokens.css?v=2603-73" />
   <link rel="stylesheet" href="/css/hud_card.css?v=2604-09" />
   <link rel="stylesheet" href="/css/app.css?v=2604-53" />
+  <link rel="stylesheet" href="/css/pages/tuner.css?v=mytune-test-1" />
 </head>
 
 <body>
@@ -262,6 +263,9 @@
       </div>
     </div>
 
+    <!-- ════════════ AUTO-TUNER ════════════ -->
+    <div id="pageTuner" class="page" style="display:none;"></div>
+
     <!-- ════════════ CARROT TEST ════════════ -->
     <div id="pageCarrot" class="page" style="display:none;">
       <div class="page-header page-header--hidden" aria-hidden="true">
@@ -415,6 +419,12 @@
       </span>
       <span>Logs</span>
     </button>
+    <button id="btnTuner" class="nav-btn">
+      <span class="nav-icon">
+        <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor"><path d="M9 2v6.5l-6 9.5A2 2 0 0 0 4.7 21h14.6a2 2 0 0 0 1.7-3l-6-9.5V2h1V0H8v2zm2 0h2v7l6 9.5H7L13 9V2z"/></svg>
+      </span>
+      <span>Tuner</span>
+    </button>
     <button id="btnTerminal" class="nav-btn">
       <span class="nav-icon">
         <svg width="24" height="24" viewBox="0 0 24 24" fill="currentColor"><path d="M4 5h16a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2m0 2v10h16V7zm2.8 8.6 3.8-3.6-3.8-3.6 1.4-1.4 5.2 5-5.2 5zm7.7 0H18v2h-3.5z"/></svg>
@@ -475,6 +485,7 @@
   <script src="/js/hud_card.js?v=2604-05"></script>
   <script src="/js/app_core.js?v=2604-22"></script>
   <script src="/js/app_pages.js?v=2604-35"></script>
+  <script src="/js/pages/tuner.js?v=mytune-test-1"></script>
   <script src="/js/raw_capnp.js?v=2604-05"></script>
   <script src="/js/app_realtime.js?v=2604-17"></script>
   <script src="/js/home_drive.js?v=2604-27"></script>

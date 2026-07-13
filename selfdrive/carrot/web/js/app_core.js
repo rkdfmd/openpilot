@@ -38,6 +38,40 @@ const UI_STRINGS = {
     tools: "도구",
     logs: "로그",
     terminal: "터미널",
+    tuner: "튜너",
+    tuner_title: "오토튜너",
+    tuner_refresh: "새로고침",
+    tuner_trend: "파라미터 추이 (최근 50회)",
+    tuner_history: "변경 이력",
+    tuner_param_reset: "파라미터 초기화",
+    tuner_clear_logs: "전체 로그 삭제",
+    tuner_reset_confirm: "오토튜닝된 모든 파라미터를 기본값으로 복원하고 학습 데이터/이력을 삭제할까요?",
+    tuner_reset_done: "파라미터를 기본값으로 복원했습니다",
+    tuner_clear_confirm: "모든 학습 데이터와 변경 이력을 삭제할까요?",
+    tuner_clear_done: "로그를 삭제했습니다",
+    tuner_no_data: "표시할 이력 데이터가 없습니다",
+    tuner_no_change: "변경 없음",
+    tuner_learn_on: "학습 ON",
+    tuner_learn_off: "학습 OFF",
+    tuner_apply_lat_on: "조향 적용 ON",
+    tuner_apply_lat_off: "조향 적용 OFF",
+    tuner_apply_long_on: "가감속 적용 ON",
+    tuner_apply_long_off: "가감속 적용 OFF",
+    tuner_driven: "누적주행",
+    tuner_changes: "건 변경",
+    tuner_latest: "최근",
+    tuner_all: "전체",
+    tuner_restore: "되돌리기",
+    tuner_restore_confirm: "이 시점의 파라미터로 되돌릴까요?",
+    tuner_restored: "이전 값으로 되돌렸습니다",
+    tuner_save_failed: "저장 실패",
+    tuner_diag_long: "종방향 진단 (phase8)",
+    tuner_diag_err: "추종오차 평균",
+    tuner_diag_lag: "지연(lag)",
+    tuner_diag_over: "진동(overshoot)",
+    tuner_diag_stop: "정지 (phase7)",
+    tuner_diag_stop_events: "정지 이벤트",
+    tuner_diag_harsh: "거친 정지",
     fleet: "Fleet",
     carrot: "당근",
     lang: "언어",
@@ -128,6 +162,40 @@ const UI_STRINGS = {
     tools: "Tools",
     logs: "Logs",
     terminal: "Terminal",
+    tuner: "Tuner",
+    tuner_title: "Auto-Tuner",
+    tuner_refresh: "Refresh",
+    tuner_trend: "Parameter trend (last 50)",
+    tuner_history: "Change history",
+    tuner_param_reset: "Parameter Init. Reset",
+    tuner_clear_logs: "Clear All Logs",
+    tuner_reset_confirm: "Restore all auto-tuned parameters to defaults and delete learning data/history?",
+    tuner_reset_done: "Parameters restored to defaults",
+    tuner_clear_confirm: "Delete all learning data and change history?",
+    tuner_clear_done: "Logs cleared",
+    tuner_no_data: "No historical data to display",
+    tuner_no_change: "no change",
+    tuner_learn_on: "Learning ON",
+    tuner_learn_off: "Learning OFF",
+    tuner_apply_lat_on: "LAT ON",
+    tuner_apply_lat_off: "LAT OFF",
+    tuner_apply_long_on: "LONG ON",
+    tuner_apply_long_off: "LONG OFF",
+    tuner_driven: "Driven",
+    tuner_changes: "changes",
+    tuner_latest: "Latest",
+    tuner_all: "All",
+    tuner_restore: "Restore",
+    tuner_restore_confirm: "Restore the parameters to this state?",
+    tuner_restored: "Restored to previous values",
+    tuner_save_failed: "Save failed",
+    tuner_diag_long: "Longitudinal (phase8)",
+    tuner_diag_err: "Mean track error",
+    tuner_diag_lag: "Lag",
+    tuner_diag_over: "Overshoot",
+    tuner_diag_stop: "Stops (phase7)",
+    tuner_diag_stop_events: "Stop events",
+    tuner_diag_harsh: "Harsh stops",
     fleet: "Fleet",
     carrot: "Carrot",
     lang: "Lang",
@@ -217,6 +285,40 @@ const UI_STRINGS = {
     tools: "工具",
     logs: "日志",
     terminal: "终端",
+    tuner: "调参",
+    tuner_title: "自动调校",
+    tuner_refresh: "刷新",
+    tuner_trend: "参数趋势 (最近50次)",
+    tuner_history: "变更历史",
+    tuner_param_reset: "参数初始化",
+    tuner_clear_logs: "清除所有日志",
+    tuner_reset_confirm: "将所有自动调校参数恢复为默认值并删除学习数据/历史？",
+    tuner_reset_done: "参数已恢复为默认值",
+    tuner_clear_confirm: "删除所有学习数据和变更历史？",
+    tuner_clear_done: "日志已清除",
+    tuner_no_data: "没有可显示的历史数据",
+    tuner_no_change: "无变更",
+    tuner_learn_on: "学习 ON",
+    tuner_learn_off: "学习 OFF",
+    tuner_apply_lat_on: "横向 ON",
+    tuner_apply_lat_off: "横向 OFF",
+    tuner_apply_long_on: "纵向 ON",
+    tuner_apply_long_off: "纵向 OFF",
+    tuner_driven: "累计行驶",
+    tuner_changes: "次变更",
+    tuner_latest: "最近",
+    tuner_all: "全部",
+    tuner_restore: "还原",
+    tuner_restore_confirm: "还原到此时的参数？",
+    tuner_restored: "已还原到先前的值",
+    tuner_save_failed: "保存失败",
+    tuner_diag_long: "纵向诊断 (phase8)",
+    tuner_diag_err: "跟踪误差均值",
+    tuner_diag_lag: "滞后(lag)",
+    tuner_diag_over: "超调(overshoot)",
+    tuner_diag_stop: "停车 (phase7)",
+    tuner_diag_stop_events: "停车事件",
+    tuner_diag_harsh: "急停",
     fleet: "车队",
     carrot: "胡萝卜",
     lang: "语言",
@@ -441,6 +543,7 @@ const btnHome = document.getElementById("btnHome");
 const btnSetting = document.getElementById("btnSetting");
 const btnLogs = document.getElementById("btnLogs");
 const btnTerminal = document.getElementById("btnTerminal");
+const btnTuner = document.getElementById("btnTuner");
 const btnFleet = document.getElementById("btnFleet");
 const btnLang = document.getElementById("btnLang");
 const langLabel = document.getElementById("langLabel");
@@ -490,6 +593,7 @@ const PAGE_ELEMENTS = {
   terminal: document.getElementById("pageTerminal"),
   branch: document.getElementById("pageBranch"),
   carrot: document.getElementById("pageCarrot"),
+  tuner: document.getElementById("pageTuner"),
 };
 
 function normalizeLangCode(raw) {
@@ -576,6 +680,7 @@ btnRecordToggle.onclick = () => toggleRecord();
 btnSetting.onclick = () => showPage("setting", true, getSwipeTransition(CURRENT_PAGE, "setting"));
 if (btnLogs) btnLogs.onclick = () => showPage("logs", true, getSwipeTransition(CURRENT_PAGE, "logs"));
 btnTerminal.onclick = () => showPage("terminal", true, getSwipeTransition(CURRENT_PAGE, "terminal"));
+if (btnTuner) btnTuner.onclick = () => showPage("tuner", true, getSwipeTransition(CURRENT_PAGE, "tuner"));
 
 async function openFleetLink() {
   const ip = location.hostname;
@@ -865,6 +970,7 @@ function showPage(page, pushHistory = false, transition = null) {
   btnTools.classList.toggle("active", page === "tools");
   if (btnLogs) btnLogs.classList.toggle("active", page === "logs");
   btnTerminal.classList.toggle("active", page === "terminal");
+  if (btnTuner) btnTuner.classList.toggle("active", page === "tuner");
 
   if (typeof updateAppViewportMetrics === "function") {
     updateAppViewportMetrics();
@@ -1066,6 +1172,7 @@ function renderUIText() {
   setNavText("btnTools", s.tools);
   setNavText("btnLogs", s.logs);
   setNavText("btnTerminal", s.terminal);
+  if (btnTuner) setNavText("btnTuner", s.tuner);
   setNavText("btnFleet", s.fleet);
   setText("btnQuickLinkWeb", "Web");
   setText("btnQuickFleet", s.fleet);

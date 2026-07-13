@@ -167,6 +167,20 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"CruiseEcoControl", {PERSISTENT, INT, "5"}},
     {"CarrotCruiseDecel", {PERSISTENT, INT, "-1"}},
     {"CarrotCruiseAtcDecel", {PERSISTENT, INT, "-1"}},
+    {"CarrotDSPComplete", {PERSISTENT, BOOL, "0"}},            // DSP: 프로파일링 완료 여부
+    {"CarrotDSPData", {PERSISTENT, BYTES, ""}},                // DSP: 수동 주행 프로파일 데이터 (JSON)
+    {"CarrotDSPPopupReady", {PERSISTENT, BOOL, "0"}},          // DSP: 팝업 신호
+    {"CarrotDSPRecommend", {PERSISTENT, BYTES, ""}},           // DSP: 초기값 추천 (JSON)
+    {"CarrotLearningActive", {PERSISTENT, INT, "0"}},          // Auto-Tuner: 학습 활성화 (0=off, 1=on)
+    {"CarrotLearningClear", {PERSISTENT, BOOL, "0"}},          // Auto-Tuner: 데이터 초기화 신호
+    {"CarrotLearningData", {PERSISTENT, BYTES, ""}},           // Auto-Tuner: 누적 데이터 (JSON)
+    {"CarrotLearningHistory", {PERSISTENT, BYTES, ""}},        // Auto-Tuner: 튜닝 이력 (JSON)
+    {"CarrotLearningPopupReady", {PERSISTENT, BOOL, "0"}},     // Auto-Tuner: 팝업 신호
+    {"CarrotLearningPopupSource", {PERSISTENT, STRING, ""}},   // Auto-Tuner: 팝업 발생 소스 ("stop", "timer", "parking", etc.)
+    {"CarrotLearningRecommend", {PERSISTENT, BYTES, ""}},      // Auto-Tuner: 추천값 (JSON)
+    {"CarrotTunerApplyLat", {PERSISTENT, INT, "0"}},           // Auto-Tuner: 조향(LAT) 적용 여부 (0=off, 1=on)
+    {"CarrotTunerApplyLong", {PERSISTENT, INT, "0"}},          // Auto-Tuner: 가감속(LONG) 적용 여부 (0=off, 1=on)
+    {"CarrotTunerFactoryReset", {PERSISTENT, BOOL, "0"}},      // Auto-Tuner: 튜닝 파라미터 공장초기화 신호
 
     {"AutoGasTokSpeed", {PERSISTENT, INT, "0"}},
     {"AutoGasSyncSpeed", {PERSISTENT, INT, "0"} },
@@ -265,6 +279,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"TFollowGap2", {PERSISTENT, INT, "90"}},
     {"TFollowGap3", {PERSISTENT, INT, "140"}},
     {"TFollowGap4", {PERSISTENT, INT, "200"}},
+    {"TFollowSpeedFactor", {PERSISTENT, INT, "0"}},
 
     {"DynamicTFollow", {PERSISTENT, INT, "35"}},
     {"DynamicTFollowLC", {PERSISTENT, INT, "50"}},
