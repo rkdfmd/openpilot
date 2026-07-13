@@ -15,7 +15,6 @@ from openpilot.common.swaglog import cloudlog
 from openpilot.common.simple_kalman import KF1D
 from openpilot.selfdrive.controls.lib.drive_helpers import is_volkswagen_meb
 from openpilot.selfdrive.controls.lib.cutin_helpers import (
-  CUTIN_DEFAULT_ENTER_MIN_INWARD_SPEED,
   associate_cutin_tracks,
   combine_cutin_future_projection,
   cutin_confirmation_frames,
@@ -68,13 +67,6 @@ CORNER_ACCEL_MAX_ABS_DPATH = 1.5
 CORNER_ACCEL_MAX_ABS_ALEAD = 3.0
 CUTIN_PROMOTE_DREL_MARGIN = 1.0
 CORNER_FRONT_MATCH_PROMOTE_DREL_MARGIN = 8.0
-CUTIN_DEFAULT_CONFIRM_S = 0.20
-CUTIN_DEFAULT_MIN_TRACK_AGE_S = 0.25
-CUTIN_DEFAULT_ENTER_MIN_X = 1.0
-CUTIN_DEFAULT_ENTER_MAX_X = 55.0
-CUTIN_DEFAULT_ENTER_MIN_ABS_DPATH = 1.5
-CUTIN_DEFAULT_ENTER_FUTURE_IN_LANE_PROB = 0.20
-CUTIN_DEFAULT_ENTER_CENTERING_GAIN = 0.20
 CUTIN_FIXED_SENSITIVITY = 50.0
 CUTIN_YAW_COMP_GAIN = 0.6
 CUTIN_YAW_COMP_MAX_DREL = 50.0
@@ -272,33 +264,38 @@ class Track:
     self.yRel_future = self.yRel + yv_rel_future * radar_lat_factor
     if ready:
       self.d_path(md)
-      self.dPath_rate, self.dPath_inward_speed = update_lane_relative_motion(
-        self._cutin_position_history,
-        self.dRel,
-        self.yRel,
-        md.laneLines[1].x,
-        md.laneLines[1].y,
-        md.laneLines[2].y,
-        self.measured,
-        track_discontinuous,
-        DT_MDL,
-      )
-      self.dPath_future, self.in_lane_prob_future = combine_cutin_future_projection(
-        self.dPath,
-        self.dPath_rate,
-        radar_lat_factor,
-        self.lane_half_width,
-        self.dPath_future,
-        self.in_lane_prob_future,
-      )
-      self.dPath_inward_speed = effective_cutin_inward_speed(
-        self.dRel,
-        v_ego=v_ego,
-        temporal_inward_speed=self.dPath_inward_speed,
-        d_path=self.dPath,
-        projected_d_path=self.dPath_future,
-        horizon_s=radar_lat_factor,
-      )
+      if is_corner_radar and radar_lat_factor > 0.0:
+        self.dPath_rate, self.dPath_inward_speed = update_lane_relative_motion(
+          self._cutin_position_history,
+          self.dRel,
+          self.yRel,
+          md.laneLines[1].x,
+          md.laneLines[1].y,
+          md.laneLines[2].y,
+          self.measured,
+          track_discontinuous,
+          DT_MDL,
+        )
+        self.dPath_future, self.in_lane_prob_future = combine_cutin_future_projection(
+          self.dPath,
+          self.dPath_rate,
+          radar_lat_factor,
+          self.lane_half_width,
+          self.dPath_future,
+          self.in_lane_prob_future,
+        )
+        self.dPath_inward_speed = effective_cutin_inward_speed(
+          self.dRel,
+          v_ego=v_ego,
+          temporal_inward_speed=self.dPath_inward_speed,
+          d_path=self.dPath,
+          projected_d_path=self.dPath_future,
+          horizon_s=radar_lat_factor,
+        )
+      else:
+        self._cutin_position_history.clear()
+        self.dPath_rate = 0.0
+        self.dPath_inward_speed = 0.0
       if self.selected_count > 0:
         self.sticky_dPath, self.sticky_path_y_std = self.path_d_path(md)
 
@@ -624,15 +621,15 @@ class RadarD:
     self.radar_lat_factor = 0.0
     self.cutin_yaw_rate = 0.0
     self.cutin_yaw_rate_filter = FirstOrderFilter(0.0, 0.20, DT_MDL)
-    self.cutin_confirm_frames = max(1, int(round(CUTIN_DEFAULT_CONFIRM_S / DT_MDL)))
-    self.cutin_min_track_age = max(1, int(round(CUTIN_DEFAULT_MIN_TRACK_AGE_S / DT_MDL)))
-    self.cutin_enter_min_x = CUTIN_DEFAULT_ENTER_MIN_X
-    self.cutin_enter_max_x = CUTIN_DEFAULT_ENTER_MAX_X
-    self.cutin_enter_min_abs_dpath = CUTIN_DEFAULT_ENTER_MIN_ABS_DPATH
-    self.cutin_enter_future_in_lane_prob = CUTIN_DEFAULT_ENTER_FUTURE_IN_LANE_PROB
-    self.cutin_enter_centering_gain = CUTIN_DEFAULT_ENTER_CENTERING_GAIN
-    self.cutin_enter_min_inward_speed = CUTIN_DEFAULT_ENTER_MIN_INWARD_SPEED
     self.cutin_tuning = cutin_tuning_from_sensitivity(CUTIN_FIXED_SENSITIVITY)
+    self.cutin_confirm_frames = max(1, int(round(self.cutin_tuning["confirm_s"] / DT_MDL)))
+    self.cutin_min_track_age = max(1, int(round(self.cutin_tuning["min_track_age_s"] / DT_MDL)))
+    self.cutin_enter_min_x = self.cutin_tuning["enter_min_x"]
+    self.cutin_enter_max_x = self.cutin_tuning["enter_max_x"]
+    self.cutin_enter_min_abs_dpath = self.cutin_tuning["enter_min_abs_dpath"]
+    self.cutin_enter_future_in_lane_prob = self.cutin_tuning["enter_future_in_lane_prob"]
+    self.cutin_enter_centering_gain = self.cutin_tuning["enter_centering_gain"]
+    self.cutin_enter_min_inward_speed = self.cutin_tuning["enter_min_inward_speed"]
 
     self.radar_detected = False
     self.lead_one_front_radar_vision_match = False
@@ -650,22 +647,16 @@ class RadarD:
 
     self.enable_radar_tracks = self.params.get_int("EnableRadarTracks")
     self.enable_corner_radar = self.params.get_int("EnableCornerRadar")
-    cutin_enabled = self.enable_corner_radar > 1
-    cutin_tuning = cutin_tuning_from_sensitivity(CUTIN_FIXED_SENSITIVITY)
-    self.cutin_tuning = cutin_tuning
-    self.radar_lat_factor = cutin_tuning["horizon_s"] if cutin_enabled else 0.0
-    self.cutin_confirm_frames = max(1, int(round(cutin_tuning["confirm_s"] / DT_MDL)))
-    self.cutin_min_track_age = max(1, int(round(cutin_tuning["min_track_age_s"] / DT_MDL)))
-    self.cutin_enter_min_x = cutin_tuning["enter_min_x"]
-    self.cutin_enter_max_x = cutin_tuning["enter_max_x"]
-    self.cutin_enter_min_abs_dpath = cutin_tuning["enter_min_abs_dpath"]
-    self.cutin_enter_future_in_lane_prob = cutin_tuning["enter_future_in_lane_prob"]
-    self.cutin_enter_centering_gain = cutin_tuning["enter_centering_gain"]
-    self.cutin_enter_min_inward_speed = cutin_tuning["enter_min_inward_speed"]
+    cutin_enabled = self.enable_corner_radar > 1 and self.car_brand == "hyundai"
+    if self.is_vw_meb:
+      # VW MEB(ID.4): 코너레이더가 없어 전방 레이더 트랙으로 끼어들기 판정 (구 carrot 검증 로직의 MEB 이식).
+      # RadarLatFactor(기본 0)로 옵트인. 타 차종은 코너레이더+현대 조건 그대로.
+      cutin_enabled = self.params.get_float("RadarLatFactor") > 0.0
+    self.radar_lat_factor = self.cutin_tuning["horizon_s"] if cutin_enabled else 0.0
     self.radar_reaction_factor = self.params.get_float("RadarReactionFactor") * 0.01
     self.detect_cut_in = cutin_enabled
     vision_only_mode = self.enable_radar_tracks <= VISION_ONLY_RADAR_TRACK_MODE
-    self.cutin_yaw_rate = self._cutin_yaw_rate_from_state(sm)
+    self.cutin_yaw_rate = self._cutin_yaw_rate_from_state(sm) if cutin_enabled else 0.0
 
     leads_v3 = sm['modelV2'].leadsV3
     if sm.recv_frame['carState'] != self.last_v_ego_frame:
@@ -676,23 +667,25 @@ class RadarD:
     if vision_only_mode:
       self.tracks.clear()
     else:
-      previous_corner_sources = {
-        tid: trk for tid, trk in self.tracks.items() if trk.measured and self._is_corner_track(trk)
-      }
       previous_corner_tracks: dict[int, Track] = {}
-      for tid, source in previous_corner_sources.items():
-        snapshot = Track(tid)
-        snapshot.inherit_cutin_state(source)
-        previous_corner_tracks[tid] = snapshot
-      current_corner_points = {
-        pt.trackId: (float(pt.dRel), float(pt.yRel), float(pt.vRel))
-        for pt in rr.points
-        if pt.measured and self._radar_point_is_corner(pt)
-      }
-      previous_corner_positions = {
-        tid: (trk.dRel, trk.yRel, trk.vRel) for tid, trk in previous_corner_tracks.items()
-      }
-      cutin_associations = associate_cutin_tracks(previous_corner_positions, current_corner_points)
+      cutin_associations: dict[int, int] = {}
+      if cutin_enabled:
+        previous_corner_sources = {
+          tid: trk for tid, trk in self.tracks.items() if trk.measured and self._is_corner_track(trk)
+        }
+        for tid, source in previous_corner_sources.items():
+          snapshot = Track(tid)
+          snapshot.inherit_cutin_state(source)
+          previous_corner_tracks[tid] = snapshot
+        current_corner_points = {
+          pt.trackId: (float(pt.dRel), float(pt.yRel), float(pt.vRel))
+          for pt in rr.points
+          if pt.measured and self._radar_point_is_corner(pt)
+        }
+        previous_corner_positions = {
+          tid: (trk.dRel, trk.yRel, trk.vRel) for tid, trk in previous_corner_tracks.items()
+        }
+        cutin_associations = associate_cutin_tracks(previous_corner_positions, current_corner_points)
       valid_ids = set()
       for pt in rr.points:
         track_id = pt.trackId
@@ -773,6 +766,10 @@ class RadarD:
         self.radar_state.leadTwo = self.leadTwo
       if self.enable_radar_tracks >= 3 or (self.cornerLeadStopped and self.cornerLeadStopped.get("status")):
         self._pick_lead_one_from_state()
+      elif self.is_vw_meb and self.detect_cut_in:
+        # MEB: carrot 상태머신의 leadCenter/정지물 승격(유령 급제동 위험으로 MEB 미사용)은 건너뛰고
+        # 끼어들기(leadCutIn) 교체만 허용. RadarLatFactor=0이면 detect_cut_in=False라 완전 비활성.
+        self._meb_apply_cutin_lead()
 
   def publish(self, pm: messaging.PubMaster):
     assert self.radar_state is not None
@@ -1026,7 +1023,8 @@ class RadarD:
     reason = cutin_entry_rejection_reason(
       enabled=self.detect_cut_in,
       lane_line_available=self.lane_line_available,
-      corner_track=self._is_corner_track(t),
+      # MEB는 전방 레이더 트랙도 후보 허용 (코너레이더 부재), 타 차종은 코너 트랙만
+      corner_track=self._is_corner_track(t) or self.is_vw_meb,
       closer_or_matching=self._cutin_is_closer_or_matches_lead_one(t, matched_front),
       track_count=t.cnt,
       min_track_age=min_track_age,
@@ -1050,7 +1048,7 @@ class RadarD:
     return reason is None
 
   def _is_cutin_keep_candidate(self, t: Track, matched_front: bool = False) -> bool:
-    if not self.detect_cut_in or not self.lane_line_available or not self._is_corner_track(t):
+    if not self.detect_cut_in or not self.lane_line_available or not (self._is_corner_track(t) or self.is_vw_meb):
       return False
     if not self._cutin_is_closer_or_matches_lead_one(t, matched_front):
       return False
@@ -1148,6 +1146,23 @@ class RadarD:
     if not lead_one.status:
       return True
     return lead["dRel"] + CUTIN_PROMOTE_DREL_MARGIN < lead_one.dRel
+
+  def _meb_apply_cutin_lead(self):
+    # VW MEB(ID.4) 전용: 전방 레이더 횡속도 기반 끼어들기 리드 선승격.
+    # carrot 상태머신 전체(_pick_lead_one_from_state)가 아니라 cut-in 교체 분기만 사용하고,
+    # 승격 리드의 가속도는 클램프해 오탐 시에도 급제동이 아닌 완만한 감속만 나오게 한다.
+    cutin = self.leadCutIn
+    if not cutin or not cutin.get("status"):
+      return
+    if not self._cutin_can_replace_lead_one(cutin):
+      return
+    chosen = dict(cutin)
+    a = float(np.clip(float(chosen.get("aLeadK", 0.0)), -1.5, 1.0))
+    chosen["aLead"] = a
+    chosen["aLeadK"] = a
+    chosen["modelProb"] = 0.03
+    self.radar_state.leadOne = chosen
+    self.radar_detected = True
 
   def _corner_stopped_can_replace_lead_one(self, stopped: dict[str, Any]) -> bool:
     lead_one = self.radar_state.leadOne
