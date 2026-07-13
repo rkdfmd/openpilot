@@ -720,10 +720,11 @@ class HudRenderer(Widget):
     if x_spd_limit > 0 and x_sign_type != 22:
       disp_speed = int(x_spd_limit if ui_state.is_metric else (x_spd_limit * KM_TO_MILE + 0.5))
       label = "CAM"
-      if self._blink_timer <= 8:
-        limit_color = rl.Color(255, 0, 0, 210)
-      else:
-        limit_color = rl.Color(255, 255, 0, 210)
+      # if self._blink_timer <= 8:  #문제시 원복
+      #   limit_color = rl.Color(255, 0, 0, 210)  #문제시 원복
+      # else:  #문제시 원복
+      #   limit_color = rl.Color(255, 255, 0, 210)  #문제시 원복
+      limit_color = rl.Color(255, 255, 0, 210)
     else:
       disp_speed = int(road_limit_speed if ui_state.is_metric else (road_limit_speed * KM_TO_MILE + 0.5))
       if self.speed > disp_speed + 2:
