@@ -876,7 +876,9 @@ def create_ccnc_messages(CP, packer, CAN, frame, CC, CS, hud_control,
 
     # --- NEW_MSG_4B9 (corner radar keep-alive?) ---
     if enable_corner_radar > 0:
-      if HDA_CntrlModSta == 0:
+      #문제시 원복
+      #if HDA_CntrlModSta == 0:
+      if True:
         if frame % 500 in [10, 20, 30]:
           values = {
             'BYTE_1': 0,
