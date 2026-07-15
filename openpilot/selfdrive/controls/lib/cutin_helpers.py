@@ -14,6 +14,7 @@ CUTIN_ASSOC_MAX_YREL = 0.75
 CUTIN_ASSOC_MAX_VREL = 2.5
 CORNER_TRACK_ID_RANGES = ((200, 220), (240, 250))
 CORNER_RADAR_SOURCES = ("corner235", "corner180")
+STABLE_CORNER_TRACK_ID_START = 1000
 CUTIN_FAST_CONFIRM_MAX_DREL = 10.0
 CUTIN_FAST_CONFIRM_MIN_INWARD_SPEED = 0.65
 CUTIN_URGENT_CONFIRM_MIN_INWARD_SPEED = 0.55
@@ -24,15 +25,51 @@ CUTIN_ASSUMED_VEHICLE_HALF_WIDTH = 0.9
 CUTIN_FAST_MAX_LANE_BOUNDARY_TTC_S = 0.55
 CUTIN_FAST_NEAR_MAX_LANE_BOUNDARY_TTC_S = 0.7
 CUTIN_FAST_MIN_RADAR_INWARD_SPEED = 0.2
+CUTIN_FAST_RADAR_INWARD_SPEED_MARGIN = 0.2
+CUTIN_FAST_MAX_PULL_AWAY_VREL_MPS = 3.0
 CUTIN_PROJECTED_BOOST_MIN_TEMPORAL_INWARD_SPEED = 0.3
+CUTIN_OUTER_TRACK_MIN_ABS_DPATH = 3.5
+FRONT_CUTIN_MIN_DREL_M = 5.0
+FRONT_CUTIN_MAX_DREL_M = 50.0
+FRONT_CUTIN_MAX_ABS_YREL_M = 7.0
+CUTIN_MAX_FRAME_Y_JUMP_M = 0.60
+FRONT_CUTIN_MIN_CONFIRM_S = 0.30
 
 
 def is_corner_track_id(track_id: int) -> bool:
   return any(start <= track_id < end for start, end in CORNER_TRACK_ID_RANGES)
 
 
+def is_stable_corner_track_id(track_id: int) -> bool:
+  return track_id >= STABLE_CORNER_TRACK_ID_START
+
+
 def is_corner_radar_source(source: Any) -> bool:
   return str(source) in CORNER_RADAR_SOURCES
+
+
+def is_front_radar_cutin_enabled(enable_radar_tracks: int, enable_corner_radar: int, car_brand: str) -> bool:
+  return car_brand == "hyundai" and enable_radar_tracks == 3 and enable_corner_radar != 2
+
+
+def is_front_radar_cutin_candidate(track_id: int, radar_source: str, d_rel: float, y_rel: float,
+                                   is_corner_radar: bool) -> bool:
+  return (
+    not is_corner_radar and
+    radar_source != "scc" and
+    track_id != 0 and
+    FRONT_CUTIN_MIN_DREL_M <= d_rel <= FRONT_CUTIN_MAX_DREL_M and
+    abs(y_rel) <= FRONT_CUTIN_MAX_ABS_YREL_M
+  )
+
+
+def is_cutin_track_discontinuous(prev_measured: bool, prev_d_rel: float, prev_y_rel: float, prev_v_lead: float,
+                                 d_rel: float, y_rel: float, v_lead: float) -> bool:
+  return prev_measured and (
+    abs(d_rel - prev_d_rel) > 5.0 or
+    abs(y_rel - prev_y_rel) > CUTIN_MAX_FRAME_Y_JUMP_M or
+    abs(v_lead - prev_v_lead) > 7.0
+  )
 
 
 def cutin_confirmation_frames(base_frames: int, d_rel: float, inward_speed: float, v_ego: float = 0.0) -> int:
@@ -63,6 +100,7 @@ def is_fast_cutin_entry(
   lane_half_width: float,
   inward_speed: float,
   radar_inward_speed: float = 0.0,
+  v_rel: float = 0.0,
 ) -> bool:
   time_gap = d_rel / max(v_ego, 1.0)
   urgent_distance = d_rel < CUTIN_FAST_CONFIRM_MAX_DREL or (v_ego > 5.0 and time_gap < CUTIN_FAST_CONFIRM_MAX_TIME_GAP_S)
@@ -75,6 +113,7 @@ def is_fast_cutin_entry(
     not urgent_distance
     or inward_speed < min_inward_speed
     or radar_inward_speed < CUTIN_FAST_MIN_RADAR_INWARD_SPEED
+    or v_rel > CUTIN_FAST_MAX_PULL_AWAY_VREL_MPS
   ):
     return False
   edge_distance = max(0.0, abs(d_path) - lane_half_width - CUTIN_ASSUMED_VEHICLE_HALF_WIDTH)
@@ -83,7 +122,8 @@ def is_fast_cutin_entry(
     if d_rel < CUTIN_FAST_CONFIRM_MAX_DREL
     else CUTIN_FAST_MAX_LANE_BOUNDARY_TTC_S
   )
-  return edge_distance / max(inward_speed, 0.1) < max_boundary_ttc
+  boundary_inward_speed = min(inward_speed, radar_inward_speed + CUTIN_FAST_RADAR_INWARD_SPEED_MARGIN)
+  return edge_distance / max(boundary_inward_speed, 0.1) < max_boundary_ttc
 
 
 def effective_cutin_inward_speed(
@@ -135,6 +175,10 @@ def associate_cutin_tracks(
   candidates: list[tuple[float, int, int]] = []
   for current_id, (d_rel, y_rel, v_rel) in current.items():
     for previous_id, (prev_d_rel, prev_y_rel, prev_v_rel) in previous.items():
+      # Stable corner IDs describe the physical radar object, not its CAN slot.
+      # Never carry cut-in history between two different physical objects.
+      if current_id != previous_id and (is_stable_corner_track_id(current_id) or is_stable_corner_track_id(previous_id)):
+        continue
       d_delta = abs(d_rel - prev_d_rel)
       y_delta = abs(y_rel - prev_y_rel)
       v_delta = abs(v_rel - prev_v_rel)
@@ -215,9 +259,20 @@ def combine_cutin_future_projection(
   lane_half_width: float,
   projected_d_path: float,
   projected_in_lane_prob: float,
+  radar_inward_speed: float | None = None,
 ) -> tuple[float, float]:
   motion_horizon = min(horizon_s, CUTIN_LANE_MOTION_HORIZON_S)
-  motion_d_path = d_path + d_path_rate * motion_horizon
+  motion_rate = d_path_rate
+  if radar_inward_speed is not None and abs(d_path) > CUTIN_OUTER_TRACK_MIN_ABS_DPATH:
+    side = math.copysign(1.0, d_path)
+    motion_inward_speed = max(0.0, -side * d_path_rate)
+    bounded_inward_speed = min(
+      motion_inward_speed,
+      max(0.0, radar_inward_speed) + CUTIN_FAST_RADAR_INWARD_SPEED_MARGIN,
+    )
+    if motion_inward_speed > 0.0:
+      motion_rate = -side * bounded_inward_speed
+  motion_d_path = d_path + motion_rate * motion_horizon
   motion_in_lane_prob = max(0.0, 1.0 - abs(motion_d_path) / max(lane_half_width, 0.1))
   moving_inward = abs(motion_d_path) < abs(d_path)
   if moving_inward and motion_in_lane_prob > projected_in_lane_prob:
