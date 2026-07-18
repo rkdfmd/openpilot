@@ -50,6 +50,7 @@ from cluster_utils import clamp, smoothstep
 from openpilot.selfdrive.controls.lib.cutin_helpers import (
     associate_cutin_tracks,
     combine_cutin_future_projection,
+    CORNER_CUTIN_MAX_DREL_M,
     cutin_confirmation_frames,
     cutin_min_track_age_frames,
     cutin_entry_rejection_reason,
@@ -250,6 +251,19 @@ class StableCornerTrack:
     hits: int = 1
 
 
+@dataclass(frozen=True, slots=True)
+class ReconstructedLiveTrack:
+    trackId: int
+    dRel: float
+    yRel: float
+    vRel: float
+    aRel: float
+    yvRel: float
+    vLead: float
+    measured: bool
+    radarSource: str
+
+
 class StableCornerObjectTracker:
     def __init__(self) -> None:
         self.tracks: dict[int, StableCornerTrack] = {}
@@ -295,7 +309,7 @@ class StableCornerObjectTracker:
         match.age = obj.age
         match.hits += 1
 
-    def points_at(self, t: float, ego_speed_kph: float) -> tuple[RadarPoint, ...]:
+    def _visible_tracks_at(self, t: float) -> tuple[tuple[StableCornerTrack, float, float], ...]:
         self._expire(t)
         visible_tracks: list[tuple[StableCornerTrack, float, float]] = []
         for track in self.tracks.values():
@@ -311,6 +325,26 @@ class StableCornerObjectTracker:
             if abs(y) > RAW_CORNER_OBJECT_MAX_ABS_Y_M:
                 continue
             visible_tracks.append((track, x, y))
+        return tuple(visible_tracks)
+
+    def live_tracks_at(self, t: float, v_ego: float) -> tuple[ReconstructedLiveTrack, ...]:
+        return tuple(
+            ReconstructedLiveTrack(
+                trackId=STABLE_CORNER_TRACK_ID_START + track.track_id,
+                dRel=x,
+                yRel=y,
+                vRel=track.vx,
+                aRel=track.ax,
+                yvRel=track.vy,
+                vLead=v_ego + track.vx,
+                measured=True,
+                radarSource="corner235" if track.group == "235" else "corner180",
+            )
+            for track, x, y in self._visible_tracks_at(t)
+        )
+
+    def points_at(self, t: float, ego_speed_kph: float) -> tuple[RadarPoint, ...]:
+        visible_tracks = self._visible_tracks_at(t)
 
         id_counts: dict[int, int] = {}
         for track, _x, _y in visible_tracks:
@@ -1270,11 +1304,19 @@ class RouteVideoFrameReader:
 
 
 class RouteLogParser:
-    def __init__(self, corner_source: str = ROUTE_CORNER_SOURCE_LIVE) -> None:
+    def __init__(
+        self,
+        corner_source: str = ROUTE_CORNER_SOURCE_LIVE,
+        reconstruct_corner_live_tracks: bool = False,
+        cutin_radar_source: str | None = None,
+    ) -> None:
         self.corner_source = route_corner_source_or_default(corner_source)
+        self.reconstruct_corner_live_tracks = reconstruct_corner_live_tracks
         self.show_recorded_cutins = os.environ.get(ROUTE_SHOW_RECORDED_CUTINS_ENV) == "1"
         self.front_radar_only = os.environ.get(ROUTE_FRONT_RADAR_ONLY_ENV) == "1"
-        self.cutin_radar_source = os.environ.get(ROUTE_CUTIN_RADAR_SOURCE_ENV, ROUTE_CUTIN_RADAR_SOURCE_CORNER)
+        self.cutin_radar_source = cutin_radar_source or os.environ.get(
+            ROUTE_CUTIN_RADAR_SOURCE_ENV, ROUTE_CUTIN_RADAR_SOURCE_CORNER
+        )
         if self.cutin_radar_source not in (ROUTE_CUTIN_RADAR_SOURCE_CORNER, ROUTE_CUTIN_RADAR_SOURCE_FRONT):
             self.cutin_radar_source = ROUTE_CUTIN_RADAR_SOURCE_CORNER
         try:
@@ -1885,7 +1927,11 @@ class RouteLogParser:
                 self.vision_yaw_rate_std_rps = clamp(yaw_std, 0.0, 2.0)
         if self.camera_calibration_euler is None:
             self.camera_calibration_euler = three_float_tuple(safe_get(camera_odometry, "wideFromDeviceEuler"))
-        self.road_transform_trans = three_float_tuple(safe_get(camera_odometry, "roadTransformTrans"))
+        # cameraOdometry's road height is a noisy per-frame vision estimate. Use
+        # it only as an initial fallback; liveCalibration supplies the stable
+        # installation height and must not be overwritten every model frame.
+        if self.road_transform_trans is None:
+            self.road_transform_trans = three_float_tuple(safe_get(camera_odometry, "roadTransformTrans"))
         self.road_transform_std = three_float_tuple(safe_get(camera_odometry, "roadTransformTransStd"))
 
     def _update_live_calibration(self, live_calibration: Any, valid: bool) -> None:
@@ -2099,11 +2145,16 @@ class RouteLogParser:
                 self.ccnc_corner_message_t = event_t
 
     def _update_live_tracks(self, live_tracks: Any, event_t: float) -> None:
-        self._update_offline_cutin(live_tracks, event_t)
+        tracks = tuple(safe_get(live_tracks, "points", ()) or ())
+        if self.reconstruct_corner_live_tracks:
+            tracks = merge_recorded_and_reconstructed_tracks(
+                tracks,
+                self.raw_corner_tracker.live_tracks_at(event_t, self.current_speed_kph / 3.6),
+                raw_corner_only=True,
+            )
+        cutin_input = ReconstructedLiveTracks(tracks) if self.reconstruct_corner_live_tracks else live_tracks
+        self._update_offline_cutin(cutin_input, event_t)
         points: dict[str, RadarPoint] = {}
-        tracks = safe_get(live_tracks, "points", ())
-        if tracks is None:
-            tracks = ()
         for index, track in enumerate(tracks):
             point = live_track_to_radar_point(
                 track,
@@ -2305,6 +2356,9 @@ class RouteLogParser:
             future_y_rel = track.y_rel + (track.yv_rel + yv_corr) * self.cutin_tuning["horizon_s"]
             track.d_path, track.in_lane_prob = self._cutin_dpath(track.d_rel, track.y_rel)
             track.d_path_future, track.in_lane_prob_future = self._cutin_dpath(future_d_rel, future_y_rel)
+            track.radar_inward_speed = max(
+                0.0, -math.copysign(1.0, track.d_path) * (track.yv_rel + yv_corr)
+            )
             track.d_path_rate, track.inward_speed = update_lane_relative_motion(
                 track.position_history,
                 track.d_rel,
@@ -2324,7 +2378,7 @@ class RouteLogParser:
                 lane_half_width,
                 track.d_path_future,
                 track.in_lane_prob_future,
-                max(0.0, -math.copysign(1.0, track.d_path) * (track.yv_rel + yv_corr)),
+                track.radar_inward_speed,
             )
             track.inward_speed = effective_cutin_inward_speed(
                 track.d_rel,
@@ -2377,9 +2431,10 @@ class RouteLogParser:
                 track.path_position_history.clear()
                 track.path_d_path_rate = 0.0
                 track.path_inward_speed = 0.0
-            track.radar_inward_speed = max(
-                0.0, -math.copysign(1.0, track.path_d_path) * (track.yv_rel + yv_corr)
-            )
+            if side_corner_confirmed:
+                track.radar_inward_speed = max(
+                    0.0, -math.copysign(1.0, track.path_d_path) * (track.yv_rel + yv_corr)
+                )
             track.cnt += 1
 
             matching_front = any(
@@ -2439,8 +2494,12 @@ class RouteLogParser:
                         track.d_path,
                         lane_half_width,
                         track.inward_speed,
-                        max(0.0, -math.copysign(1.0, track.y_rel) * track.yv_rel),
+                        track.radar_inward_speed,
                         v_rel=track.v_rel,
+                    ),
+                    radar_inward_speed=track.radar_inward_speed,
+                    max_d_rel=(
+                        CORNER_CUTIN_MAX_DREL_M if self._is_corner_live_track(point) else None
                     ),
                 )
             track.rejection_reason = entry_rejection_reason or "enter"
@@ -4542,6 +4601,53 @@ def raw_corner_object_to_radar_point(obj: RawCornerObject, ego_speed_kph: float)
         valid=1,
         valid_count=obj.age,
     )
+
+
+@dataclass(frozen=True, slots=True)
+class ReconstructedLiveTracks:
+    points: tuple[Any, ...]
+
+
+def merge_recorded_and_reconstructed_tracks(
+    recorded: tuple[Any, ...],
+    reconstructed: tuple[ReconstructedLiveTrack, ...],
+    prefer_reconstructed_corner: bool = False,
+    raw_corner_only: bool = False,
+) -> tuple[Any, ...]:
+    recorded_groups: set[str] = set()
+    for point in recorded:
+        source = str(safe_get(point, "radarSource", "frontRadar"))
+        track_id = int(safe_get(point, "trackId", -1))
+        if source == "corner235" or CORNER_OBJECT_TRACK_ID_OFFSET <= track_id < CORNER_OBJECT_TRACK_ID_OFFSET + CORNER_OBJECT_TRACK_COUNT:
+            recorded_groups.add("corner235")
+        if source == "corner180" or CORNER_OBJECT_180_TRACK_ID_OFFSET <= track_id < CORNER_OBJECT_180_TRACK_ID_OFFSET + CORNER_OBJECT_180_TRACK_COUNT:
+            recorded_groups.add("corner180")
+    if raw_corner_only:
+        recorded = tuple(
+            point for point in recorded
+            if not point_is_corner_group(point, "corner235") and not point_is_corner_group(point, "corner180")
+        )
+        recorded_groups.clear()
+    elif prefer_reconstructed_corner:
+        reconstructed_groups = {point.radarSource for point in reconstructed}
+        recorded = tuple(
+            point for point in recorded
+            if not (
+                ("corner235" in reconstructed_groups and point_is_corner_group(point, "corner235"))
+                or ("corner180" in reconstructed_groups and point_is_corner_group(point, "corner180"))
+            )
+        )
+        recorded_groups -= reconstructed_groups
+    added = tuple(point for point in reconstructed if point.radarSource not in recorded_groups)
+    return recorded + added
+
+
+def point_is_corner_group(point: Any, group: str) -> bool:
+    source = str(safe_get(point, "radarSource", "frontRadar"))
+    track_id = int(safe_get(point, "trackId", -1))
+    if group == "corner235":
+        return source == group or CORNER_OBJECT_TRACK_ID_OFFSET <= track_id < CORNER_OBJECT_TRACK_ID_OFFSET + CORNER_OBJECT_TRACK_COUNT
+    return source == group or CORNER_OBJECT_180_TRACK_ID_OFFSET <= track_id < CORNER_OBJECT_180_TRACK_ID_OFFSET + CORNER_OBJECT_180_TRACK_COUNT
 
 
 def route_corner_source_or_default(source: str | None) -> str:
