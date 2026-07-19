@@ -141,6 +141,8 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"ScreenRecord", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, BOOL} },
     {"CarrotNaviDebug", {CLEAR_ON_MANAGER_START, STRING} },
     {"CarrotNaviImage", {CLEAR_ON_MANAGER_START, STRING} },
+    {"CarrotNaviWebBootstrapRequest", {CLEAR_ON_MANAGER_START, STRING} },
+    {"CarrotVisionActive", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, BOOL} },
     {"TrafficLight", {CLEAR_ON_MANAGER_START, STRING} },
 
     {"ApiCache_NavDestinations", {PERSISTENT, STRING}},
@@ -166,7 +168,6 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"ShowDebugUI", {PERSISTENT, INT, "0"}},
     {"ShowDateTime", {PERSISTENT, INT, "1"}},
     {"ShowLaneInfo", {PERSISTENT, INT, "1"}},
-    {"CarrotTireTrajectory", {PERSISTENT, INT, "0"}},
     {"ShowRadarInfo", {PERSISTENT, INT, "1"}},
     {"ShowDeviceState", {PERSISTENT, INT, "1"}},
     {"ShowPathMode", {PERSISTENT, INT, "9"}},
@@ -188,6 +189,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"ClusterHudTheme", {PERSISTENT, INT, "0"}},
     {"ClusterNaviMapTheme", {PERSISTENT, INT, "1"}},
     {"ClusterNaviMapType", {PERSISTENT, INT, "0"}},
+    {"ClusterNaviMapFps", {PERSISTENT, INT, "1"}},
     {"ClusterHudLiveFps", {PERSISTENT, INT, "1"}},
     {"ClusterHudScreenMode", {PERSISTENT, INT, "0"}},
     {"ClusterHudCameraViewMode", {PERSISTENT, INT, "0"}},
@@ -232,7 +234,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
 
     {"MapTurnSpeedFactor", {PERSISTENT, INT, "90"}},
     {"ModelTurnSpeedFactor", {PERSISTENT, INT, "0"}},
-    {"StoppingAccel", {PERSISTENT, INT, "0"}},
+    {"StoppingAccel", {PERSISTENT, INT, "-50"}},
     {"AutoSpeedUptoRoadSpeedLimit", {PERSISTENT, INT, "0"}},
     {"AutoRoadSpeedAdjust", {PERSISTENT, INT, "50"}},
 
@@ -282,6 +284,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"EnableRadarTracks", {PERSISTENT, INT, "0"}},
     {"RadarLatFactor", {PERSISTENT, INT, "0"}},
     {"EnableCornerRadar", {PERSISTENT, INT, "0"}},
+    {"RadarLeadModelMode", {PERSISTENT, INT, "0"}},
 
     {"EnableRadarTracksResult", {PERSISTENT | CLEAR_ON_MANAGER_START, INT}},
     {"CanParserResult", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, STRING}},
