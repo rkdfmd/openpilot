@@ -14,7 +14,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from openpilot.selfdrive.carrot.radar_lead_simulator import (
   DEFAULT_MULTITASK_MODEL,
-  MultitaskLeadSelector,
+  ProductionHybridLeadSelector,
   current_cutin_track_ids,
   load_frames,
 )
@@ -64,6 +64,96 @@ def event_text(event: tuple[float, int] | None) -> str:
   return "--" if event is None else f"{event[0]:.2f}s/id{event[1]}"
 
 
+def lead_constraint_status(selector, frames, case) -> tuple[bool, str]:
+  start, end = (float(value) for value in case["window"])
+  indexed = [
+    (frame, selector.select(frame, index))
+    for index, frame in enumerate(frames)
+    if start <= frame.time_s <= end
+  ]
+  details: list[str] = []
+  passed = True
+  required_one = {int(value) for value in case.get("required_lead_one_ids", ())}
+  if required_one:
+    matches = [
+      (frame.time_s, selection.lead_one.track_id)
+      for frame, selection in indexed
+      if selection.lead_one is not None and selection.lead_one.track_id in required_one
+    ]
+    required_pass = bool(matches)
+    if case.get("require_lead_one_continuous", False):
+      required_pass = bool(indexed) and all(
+        selection.lead_one is not None and selection.lead_one.track_id in required_one
+        for _, selection in indexed
+      )
+    passed &= required_pass
+    details.append(f"L1={'ok' if required_pass else 'missing'}")
+
+  for field, attribute, label in (
+    ("forbidden_lead_one_ids", "lead_one", "badL1"),
+    ("forbidden_lead_two_ids", "lead_two", "badL2"),
+  ):
+    forbidden = {int(value) for value in case.get(field, ())}
+    if not forbidden:
+      continue
+    event = next((
+      (frame.time_s, lead.track_id)
+      for frame, selection in indexed
+      if (lead := getattr(selection, attribute)) is not None and lead.track_id in forbidden
+    ), None)
+    passed &= event is None
+    details.append(f"{label}={event_text(event)}")
+  return passed, " ".join(details)
+
+
+def cutin_continuity_status(selector, frames, case) -> tuple[bool, str]:
+  if not case.get("require_cutin_continuity", False):
+    return True, ""
+
+  start, end = (float(value) for value in case["window"])
+  targets = {int(value) for value in case.get("target_track_ids", ())}
+  indexed = [
+    (frame, selector.select(frame, index))
+    for index, frame in enumerate(frames)
+    if start <= frame.time_s <= end
+  ]
+
+  first_active = next((offset for offset, (_, selection) in enumerate(indexed) if any(
+    not targets or candidate.track_id in targets
+    for candidate in selection.active_cutin_candidates
+  )), None)
+  if first_active is None:
+    return False, "continuity=no-start"
+
+  takeover = next((offset for offset in range(first_active, len(indexed)) if (
+    indexed[offset][1].lead_one is not None
+    and (not targets or indexed[offset][1].lead_one.track_id in targets)
+  )), None)
+  if case.get("require_lead_one_takeover", False) and takeover is None:
+    return False, "continuity=no-L1-takeover"
+
+  stop = takeover if takeover is not None else len(indexed) - 1
+  last_present_s = indexed[first_active][0].time_s
+  max_gap_s = 0.0
+  for frame, selection in indexed[first_active:stop + 1]:
+    lead_one_present = selection.lead_one is not None and (
+      not targets or selection.lead_one.track_id in targets
+    )
+    cutin_present = any(
+      not targets or candidate.track_id in targets
+      for candidate in selection.active_cutin_candidates
+    )
+    if lead_one_present or cutin_present:
+      last_present_s = frame.time_s
+    else:
+      max_gap_s = max(max_gap_s, frame.time_s - last_present_s)
+
+  allowed_gap_s = float(case.get("max_cutin_gap_s", 0.15))
+  passed = max_gap_s <= allowed_gap_s
+  takeover_text = "--" if takeover is None else f"{indexed[takeover][0].time_s:.2f}s"
+  return passed, f"continuity=gap{max_gap_s:.2f}s/L1@{takeover_text}"
+
+
 def main() -> int:
   args = parse_args()
   payload = json.loads(args.cases.read_text(encoding="utf-8"))
@@ -87,8 +177,8 @@ def main() -> int:
     if path not in cache:
       print(f"loading {path.name} ...", flush=True)
       frames = load_frames(path)
-      baseline = MultitaskLeadSelector(args.baseline_model, frames, include_scc=True, vision_match_primary=True)
-      candidate = MultitaskLeadSelector(args.model, frames, include_scc=True, vision_match_primary=True)
+      baseline = ProductionHybridLeadSelector(args.baseline_model, frames)
+      candidate = ProductionHybridLeadSelector(args.model, frames)
       radard_ids = current_cutin_track_ids(path, frames, (str(case["source"]),))
       cache[path] = frames, baseline, candidate, {str(case["source"]): radard_ids}
     frames, baseline, candidate, source_ids = cache[path]
@@ -98,7 +188,12 @@ def main() -> int:
     radard_event = first_radard_cutin(frames, source_ids[source], case)
     baseline_event = first_model_cutin(baseline, frames, case)
     candidate_event = first_model_cutin(candidate, frames, case)
-    passed = (candidate_event is not None) == (case["expected"] == "detect")
+    lead_passed, lead_status = lead_constraint_status(candidate, frames, case)
+    continuity_passed, continuity_status = cutin_continuity_status(candidate, frames, case)
+    passed = (
+      (candidate_event is not None) == (case["expected"] == "detect")
+      and lead_passed and continuity_passed
+    )
     failures += not passed
     delta = ""
     if candidate_event is not None and radard_event is not None:
@@ -106,7 +201,7 @@ def main() -> int:
     print(
       f"[{index:02d}/{len(cases):02d}] {'PASS' if passed else 'FAIL'} {case['id']} "
       f"radard={event_text(radard_event)} base={event_text(baseline_event)} "
-      f"candidate={event_text(candidate_event)}{delta}", flush=True,
+      f"candidate={event_text(candidate_event)}{delta} {lead_status} {continuity_status}", flush=True,
     )
   print(f"\n{len(cases) - failures}/{len(cases)} passed")
   return int(bool(failures))
