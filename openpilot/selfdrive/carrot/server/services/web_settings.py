@@ -318,7 +318,13 @@ def _normalize_kmap_url(value: Any) -> str:
 
 def _normalize_web_upload_url(value: Any) -> str:
   try:
-    return normalize_base_url(value, DEFAULT_WEB_UPLOAD_URL)
+    url = normalize_base_url(value, DEFAULT_WEB_UPLOAD_URL)
+    # Migrate defaults used before the upload receiver moved to its dedicated
+    # HTTPS virtual host. The main shind0 host serves Carrot Web and returns an
+    # HTML 404 for upload API paths.
+    if url.casefold() in {"https://op.wjcloud.kr", "https://shind0.synology.me"}:
+      return DEFAULT_WEB_UPLOAD_URL
+    return url
   except ValueError:
     return DEFAULT_WEB_UPLOAD_URL
 
@@ -391,6 +397,7 @@ WEB_SETTINGS_SPEC: List[_Field] = [
   _Field("mini_hud_enabled", "bool", False),
   _Field("web_language", "str", "", normalize=_normalize_language),
   _Field("vision_fullscreen_default", "bool", False),
+  _Field("vision_ar_enabled", "bool", False),
   _Field("vision_display_mode", "enum", "normal", choices={"fit", "normal", "crop"}),
   _Field("replay_hud_visible", "bool", False),
   _Field("replay_insights_tab", "enum", "events", choices=WEB_REPLAY_INSIGHTS_TABS),
@@ -412,7 +419,6 @@ WEB_SETTINGS_SPEC: List[_Field] = [
   # Keep the upstream Carrot Web API configuration intact. Toss remains an
   # additional target with independent credentials.
   _Field("web_upload_url", "str", DEFAULT_WEB_UPLOAD_URL, normalize=_normalize_web_upload_url),
-  _Field("web_upload_token", "str", "", normalize=_normalize_stripped),
   _Field("toss_upload_url", "str", DEFAULT_TOSS_UPLOAD_URL, normalize=_normalize_toss_upload_url),
   _Field("toss_upload_token", "str", "", normalize=_normalize_stripped),
   # Remote support last-used settings, persisted so the owner's choices survive a
