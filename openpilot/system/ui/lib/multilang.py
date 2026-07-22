@@ -28,7 +28,7 @@ PLURAL_SELECTORS = {
   'en': lambda n: 0 if n == 1 else 1,
   'de': lambda n: 0 if n == 1 else 1,
   'fr': lambda n: 0 if n <= 1 else 1,
-  'pt-BR': lambda n: 0 if n <= 1 else 1,
+  'pt-BR': lambda n: 0 if n == 1 else 1,
   'es': lambda n: 0 if n == 1 else 1,
   'tr': lambda n: 0 if n == 1 else 1,
   'uk': lambda n: 0 if n % 10 == 1 and n % 100 != 11 else (1 if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else 2),
@@ -38,6 +38,20 @@ PLURAL_SELECTORS = {
   'ko': lambda n: 0,
   'ja': lambda n: 0,
 }
+
+_KOREAN_BRAND_NAME = "강릉 파일럿"
+_KOREAN_BRAND_LEGAL_TEXTS = {
+  "You must accept the Terms and Conditions in order to use openpilot.",
+  "You must accept the Terms and Conditions to use openpilot. Read the latest terms at https://comma.ai/terms before continuing.",
+}
+
+
+def _brand_korean_text(source: str, translated: str) -> str:
+  if source in _KOREAN_BRAND_LEGAL_TEXTS:
+    return translated
+  branded = re.sub(r"강릉 파일(?!럿)", _KOREAN_BRAND_NAME, translated)
+  branded = branded.replace("오픈파일럿", _KOREAN_BRAND_NAME)
+  return re.sub(r"(?<![A-Za-z0-9_/])openpilot(?![A-Za-z0-9_/])", _KOREAN_BRAND_NAME, branded)
 
 
 def _parse_quoted(s: str) -> str:
@@ -181,15 +195,17 @@ class Multilang:
     self.setup()
 
   def tr(self, text: str) -> str:
-    return self._translations.get(text, text) or text
+    translated = self._translations.get(text, text) or text
+    return _brand_korean_text(text, translated) if self._language == "ko" else translated
 
   def trn(self, singular: str, plural: str, n: int) -> str:
+    translated = singular if n == 1 else plural
     if singular in self._plurals:
       idx = self._plural_selector(n)
       forms = self._plurals[singular]
       if idx < len(forms) and forms[idx]:
-        return forms[idx]
-    return singular if n == 1 else plural
+        translated = forms[idx]
+    return _brand_korean_text(singular, translated) if self._language == "ko" else translated
 
   def _load_languages(self):
     with LANGUAGES_FILE.open(encoding='utf-8') as f:
