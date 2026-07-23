@@ -634,7 +634,15 @@ class CarrotMan:
                 self.remote_addr = remote_addr
                 try:
                   json_obj = json.loads(data.decode())
-                  self.carrot_serv.update(json_obj)
+                  #문제시 원복: 구버전(TmapNda UDP) 프로토콜을 신버전 rgdata 파이프라인으로 승격
+                  # TmapNda는 여전히 flat JSON(nRoadLimitSpeed, nSdiType 등)을 UDP 7706으로 보내는데,
+                  # lfa2-test의 신규 기능(디버그 파라미터, 클러스터 오버레이 등)은 _dispatch_obj를
+                  # 거쳐야만 갱신되므로 여기서도 동일 파이프라인을 태워준다.
+                  if isinstance(json_obj, dict) and not any(k in json_obj for k in ("rgdata", "vrtx", "route", "sinf", "ssinf", "complexCrossroad")):
+                    envelope = {"rgdata": json_obj, "timestamp_ms": int(time.time() * 1000)}
+                    self._dispatch_obj(envelope)
+                  else:
+                    self._dispatch_obj(json_obj)
                 except Exception as e:
                   print(f"carrot_man_thread: json error...: {e}")
                   print(data)
