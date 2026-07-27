@@ -109,6 +109,8 @@ CORNER_OBJECT_TRACK_ID_OFFSET = 200
 CORNER_OBJECT_TRACK_COUNT = 20
 CORNER_OBJECT_180_TRACK_ID_OFFSET = 240
 CORNER_OBJECT_180_TRACK_COUNT = 10
+CORNER_OBJECT_430_TRACK_ID_OFFSET = 300
+CORNER_OBJECT_430_TRACK_COUNT = 112
 CORNER_OBJECT_SOURCE = "cornerRadar"
 RAW_CORNER_RADAR_BUS = 1
 RAW_CORNER_235_START_ADDR = 0x235
@@ -250,6 +252,12 @@ class StableCornerTrack:
     quality: int
     age: int
     hits: int = 1
+    lead_filter_t: float | None = None
+    lead_filter_count: int = 0
+    v_lead_filtered: float = 0.0
+    v_lead_filtered_last: float = 0.0
+    a_lead_filtered: float = 0.0
+    j_lead_filtered: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,6 +271,8 @@ class ReconstructedLiveTrack:
     vLead: float
     measured: bool
     radarSource: str
+    aLead: float = 0.0
+    jLead: float = 0.0
 
 
 class StableCornerObjectTracker:
@@ -329,20 +339,59 @@ class StableCornerObjectTracker:
         return tuple(visible_tracks)
 
     def live_tracks_at(self, t: float, v_ego: float) -> tuple[ReconstructedLiveTrack, ...]:
-        return tuple(
-            ReconstructedLiveTrack(
+        live_tracks: list[ReconstructedLiveTrack] = []
+        for track, x, y in self._visible_tracks_at(t):
+            v_lead = v_ego + track.vx
+            a_lead, j_lead = self._update_lead_dynamics(track, t, v_lead)
+            live_tracks.append(ReconstructedLiveTrack(
                 trackId=STABLE_CORNER_TRACK_ID_START + track.track_id,
                 dRel=x,
                 yRel=y,
                 vRel=track.vx,
                 aRel=track.ax,
                 yvRel=track.vy,
-                vLead=v_ego + track.vx,
+                vLead=v_lead,
                 measured=True,
                 radarSource="corner235" if track.group == "235" else "corner180",
-            )
-            for track, x, y in self._visible_tracks_at(t)
-        )
+                aLead=a_lead,
+                jLead=j_lead,
+            ))
+        return tuple(live_tracks)
+
+    @staticmethod
+    def _update_lead_dynamics(track: StableCornerTrack, t: float, v_lead: float) -> tuple[float, float]:
+        # Mirrors the RadarInterface MyTrack filter for raw-CAN replay. The
+        # six-sample warm-up keeps reconstructed corner points aligned with
+        # the values emitted by a running device.
+        if track.lead_filter_t is None or t <= track.lead_filter_t or t - track.lead_filter_t > 0.25:
+            track.lead_filter_t = t
+            track.lead_filter_count = 1
+            track.v_lead_filtered = v_lead
+            track.v_lead_filtered_last = v_lead
+            track.a_lead_filtered = 0.0
+            track.j_lead_filtered = 0.0
+            return 0.0, 0.0
+
+        dt = max(0.01, min(0.10, t - track.lead_filter_t))
+        track.lead_filter_t = t
+        v_alpha = dt / (0.1 + dt)
+        a_alpha = dt / (0.15 + dt)
+        j_alpha = dt / (0.4 + dt)
+        track.v_lead_filtered += v_alpha * (v_lead - track.v_lead_filtered)
+        pseudo_stop = abs(track.v_lead_filtered) < 0.3 and abs(v_lead - track.v_lead_filtered) < 0.05
+        a_raw = (track.v_lead_filtered - track.v_lead_filtered_last) / dt
+        track.v_lead_filtered_last = track.v_lead_filtered
+        if abs(a_raw - track.a_lead_filtered) > 3.0:
+            track.lead_filter_count = 0
+        a_input = 0.0 if pseudo_stop else clamp(a_raw, -10.0, 5.0)
+        previous_a_lead = track.a_lead_filtered
+        track.a_lead_filtered += a_alpha * (a_input - track.a_lead_filtered)
+        j_input = (track.a_lead_filtered - previous_a_lead) / dt if track.lead_filter_count > 2 else 0.0
+        track.j_lead_filtered += j_alpha * (j_input - track.j_lead_filtered)
+        track.lead_filter_count += 1
+        if track.lead_filter_count < 6:
+            return 0.0, 0.0
+        return track.a_lead_filtered, track.j_lead_filtered
 
     def points_at(self, t: float, ego_speed_kph: float) -> tuple[RadarPoint, ...]:
         visible_tracks = self._visible_tracks_at(t)
@@ -468,6 +517,7 @@ class RouteReplayFrame:
     ev_mode_active: bool = False
     display_speed_kph: float | None = None
     traffic_state: int = 0
+    driving_mode: int | None = None
     planned_speed_kph: float | None = None
     planned_accel_mps2: float | None = None
     planned_curvature_m_inv: float | None = None
@@ -1448,6 +1498,7 @@ class RouteLogParser:
         self.longitudinal_plan_allow_throttle: bool | None = None
         self.longitudinal_plan_allow_brake: bool | None = None
         self.traffic_state = 0
+        self.driving_mode: int | None = None
         self.longitudinal_t_follow_s: float | None = None
         self.longitudinal_desired_distance_m: float | None = None
         self.longitudinal_v_target_kph: float | None = None
@@ -1523,7 +1574,10 @@ class RouteLogParser:
             elif event_type in ("navInstructionCarrot", "navInstruction"):
                 self._update_nav_instruction(getattr(event, event_type), event_t)
             elif event_type == "longitudinalPlan":
-                self._update_longitudinal_plan(event.longitudinalPlan)
+                self._update_longitudinal_plan(
+                    event.longitudinalPlan,
+                    bool(safe_get(event, "valid", True)),
+                )
             elif event_type == "controlsState":
                 self._update_controls_state(event.controlsState)
             elif event_type == "selfdriveState":
@@ -1678,6 +1732,7 @@ class RouteLogParser:
             ev_mode_active=ev_mode_active,
             display_speed_kph=display_speed_kph,
             traffic_state=self.traffic_state,
+            driving_mode=self.driving_mode,
             planned_speed_kph=self.planned_speed_kph,
             planned_accel_mps2=self.planned_accel_mps2,
             planned_curvature_m_inv=self.model_action_curvature_m_inv,
@@ -1886,7 +1941,7 @@ class RouteLogParser:
             self.nav_speed_limit_kph = None
             self.nav_speed_limit_t = -999.0
 
-    def _update_longitudinal_plan(self, longitudinal_plan: Any) -> None:
+    def _update_longitudinal_plan(self, longitudinal_plan: Any, valid: bool = True) -> None:
         self.longitudinal_plan_source = enum_text(
             safe_get(longitudinal_plan, "longitudinalPlanSource", self.longitudinal_plan_source or "")
         ) or self.longitudinal_plan_source
@@ -1914,6 +1969,8 @@ class RouteLogParser:
         traffic_state = safe_optional_int(longitudinal_plan, "trafficState")
         if traffic_state in (0, 1, 2):
             self.traffic_state = traffic_state
+        driving_mode = safe_optional_int(longitudinal_plan, "myDrivingMode")
+        self.driving_mode = driving_mode if valid and driving_mode in (1, 2, 3, 4) else None
         t_follow = safe_optional_float(longitudinal_plan, "tFollow")
         if t_follow is not None and 0.0 <= t_follow <= 5.0:
             self.longitudinal_t_follow_s = t_follow
@@ -3647,6 +3704,7 @@ def frame_to_state(frame: RouteReplayFrame) -> ClusterUiState:
         lateral_plan_curvature_rates=frame.lateral_plan_curvature_rates,
         display_speed_kph=frame.display_speed_kph,
         traffic_state=frame.traffic_state,
+        driving_mode=frame.driving_mode,
         recorded_cutin_active=frame.recorded_cutin_active,
         recorded_cutin_sound=frame.recorded_cutin_sound,
     )
@@ -3751,6 +3809,7 @@ def blend_frames(left: RouteReplayFrame, right: RouteReplayFrame, amount: float)
         gear_text=discrete.gear_text,
         cruise_gap=discrete.cruise_gap,
         traffic_state=discrete.traffic_state,
+        driving_mode=discrete.driving_mode,
         lfa_active=discrete.lfa_active,
         active_lane_line=discrete.active_lane_line,
         left_signal=discrete.left_signal,
@@ -4511,10 +4570,12 @@ def radar_track_id_is_corner_object(track_id: int | None) -> bool:
 
 def corner_track_label(track_id: int, radar_source: str = "") -> str:
     if is_stable_corner_track_id(track_id):
-        group = "180" if radar_source == "corner180" else "235"
+        group = "180" if radar_source == "corner180" else "430" if radar_source == "corner430" else "235"
         return f"CR{group}_T{track_id}"
     if CORNER_OBJECT_180_TRACK_ID_OFFSET <= track_id < CORNER_OBJECT_180_TRACK_ID_OFFSET + CORNER_OBJECT_180_TRACK_COUNT:
         return f"CR180_{track_id - CORNER_OBJECT_180_TRACK_ID_OFFSET:02d}"
+    if CORNER_OBJECT_430_TRACK_ID_OFFSET <= track_id < CORNER_OBJECT_430_TRACK_ID_OFFSET + CORNER_OBJECT_430_TRACK_COUNT:
+        return f"CR430_{track_id - CORNER_OBJECT_430_TRACK_ID_OFFSET:03d}"
     return f"CR{track_id - CORNER_OBJECT_TRACK_ID_OFFSET:02d}"
 
 

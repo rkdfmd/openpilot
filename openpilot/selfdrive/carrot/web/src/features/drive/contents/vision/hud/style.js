@@ -15,8 +15,8 @@ export const CSS = `
   font-style:normal;
   font-weight:900;
 }
-/* 구 HUD 완전 배제 — 신규 오버레이가 대체. DOM은 남겨둔다(그래야 DriveVisionHudContent가
- * 생성되고 그 update를 래핑해 실데이터를 받음). !important로 표시만 차단. */
+/* 구 HUD 완전 배제 — 신규 오버레이가 대체. 기존 DOM은 호환 수명주기 루트로만 남기고
+ * 실데이터 렌더는 신규 오버레이 하나가 담당한다. !important로 표시를 차단. */
 #driveHudCard { display:none !important; }
 /* 미니 HUD는 구 HUD가 아니라 별개 기능(웹설정 > HUD > 미니 HUD)이다. 평소에는 이 오버레이가
  * 화면을 차지하므로 함께 숨기되, 미니 HUD 모드가 실제로 켜졌을 때는 그 자체가 유일한 표시
@@ -33,7 +33,7 @@ html:not([data-carrot-mini-hud="1"]) #carrotMiniHud { display:none !important; }
   container-type:size; container-name:chud;
   --chud-font:"CarrotClusterHud", "Segoe UI", system-ui, sans-serif;
   --chud-weight:900;
-  --chud-white:#fff; --chud-carrot:#14bc68; --chud-limit:#de4840; --chud-stroke:#05090c;
+  --chud-white:#fff; --chud-carrot:#14bc68; --chud-limit:#de4840; --chud-amber:#f4ac36; --chud-stroke:#05090c;
   --chud-muted:#96a0ac;
 }
 .chud::before,.chud::after{
@@ -53,8 +53,10 @@ html:not([data-carrot-mini-hud="1"]) #carrotMiniHud { display:none !important; }
   flex-direction:column;align-items:flex-start;gap:clamp(10px,2.4cqw,22px)}
 .chud-zone--tr{right:0;top:0;padding:clamp(10px,3cqw,28px);align-items:flex-start;
   gap:clamp(6px,1.4cqw,14px)}
+/* 방향지시등/비상등은 최상단이 아니라 좌상단 제한속도 밴드와 상하 높이를 맞춘다.
+ * (제한속도 중심 ≈ tl패딩+상단아이콘행+gap+표지반높이 → 아래 clamp가 그 밴드 중심을 추종) */
 .chud-zone--tc{left:50%;top:0;transform:translateX(-50%);padding:clamp(8px,2cqw,20px);
-  gap:clamp(10px,3cqw,26px)}
+  padding-top:clamp(54px,11cqw,108px);gap:clamp(10px,3cqw,26px)}
 .chud-zone--bl{left:0;bottom:0;padding:clamp(10px,3cqw,30px);
   flex-direction:column;align-items:flex-start;gap:clamp(6px,1.2cqw,12px)}
 .chud-zone--br{right:clamp(98px,11cqw,122px);bottom:0;padding:clamp(10px,3cqw,30px)}
@@ -62,17 +64,17 @@ html:not([data-carrot-mini-hud="1"]) #carrotMiniHud { display:none !important; }
 
 /* accel/steer 게이지 */
 .chud-gauge-column{display:grid;grid-template-columns:minmax(0,1fr);gap:0}
-.chud-gauge{width:clamp(34px,5cqw,62px);height:auto;display:block;
+.chud-gauge{width:clamp(40px,6cqw,74px);height:auto;display:block;
   filter:drop-shadow(0 2px 6px rgba(0,0,0,.5))}
 .chud-gauge-frame{fill:rgba(0,0,0,0);stroke:rgba(240,244,248,.745);stroke-width:2}
 .chud-gauge-mid{stroke:rgb(98,112,128);stroke-width:3}
-.chud-gauge-value,.chud-gauge-label{font-family:var(--chud-font);font-weight:800;
-  paint-order:stroke;stroke:var(--chud-stroke);stroke-width:2}
-.chud-level{width:clamp(34px,5cqw,62px);height:auto;display:block;
+.chud-gauge-value,.chud-gauge-label{font-family:var(--chud-font);font-weight:900;
+  paint-order:stroke;stroke:var(--chud-stroke);stroke-width:2.4}
+.chud-level{width:clamp(40px,6cqw,74px);height:auto;display:block;
   filter:drop-shadow(0 2px 6px rgba(0,0,0,.5))}
 .chud-level-frame{fill:transparent;stroke:rgba(240,244,248,.745);stroke-width:2}
-.chud-level-value,.chud-level-label{font-family:var(--chud-font);font-weight:800;
-  paint-order:stroke;stroke:var(--chud-stroke);stroke-width:2}
+.chud-level-value,.chud-level-label{font-family:var(--chud-font);font-weight:900;
+  paint-order:stroke;stroke:var(--chud-stroke);stroke-width:2.4}
 
 /* TPMS */
 .chud-tpms{width:clamp(84px,12cqw,120px);height:auto;display:block;
@@ -99,10 +101,24 @@ html:not([data-carrot-mini-hud="1"]) #carrotMiniHud { display:none !important; }
 
 /* LFA 당근 — 클러스터 동작: 활성 풀컬러 / 비활성 회색 + 조향각 회전 */
 .chud-lfa{position:relative;display:flex;align-items:center;justify-content:center}
-.chud-lfa-img{height:clamp(28px,5.6cqw,56px);width:clamp(28px,5.6cqw,56px);display:block;object-fit:contain;
+/* 레인 날개(폭 2x)가 뜰 때만 그 오버행(각 변 휠 절반)을 패딩으로 예약 →
+ * 옆 위젯과 겹치거나 좌측으로 삐져나가지 않는다(휠 위치는 중앙 유지). */
+.chud-lfa.has-lane{padding-inline:clamp(14px,2.8cqw,28px)}
+.chud-lfa-img{position:relative;z-index:1;height:clamp(28px,5.6cqw,56px);width:clamp(28px,5.6cqw,56px);display:block;object-fit:contain;
   transform-origin:50% 50%;transition:transform .12s linear,filter .2s,opacity .2s;
   filter:drop-shadow(0 2px 5px rgba(0,0,0,.55))}
 .chud-lfa:not(.is-active) .chud-lfa-img{opacity:.5;filter:grayscale(.7) drop-shadow(0 2px 5px rgba(0,0,0,.55))}
+/* 레인 초록 날개(carrot_wheel_lane 실루엣). 폭 2x·높이=휠(cluster LFA_LANE_ICON_WIDTH_SCALE=2),
+ * 휠 뒤에 깔리고 좌우로 삐져나온다. 색=배경(활성 초록/비활성 muted), 모양=mask(JS가 URL 주입). */
+.chud-lfa-lane{position:absolute;left:50%;top:50%;
+  transform:translate(-50%,-56%);pointer-events:none;z-index:0;
+  width:clamp(56px,11.2cqw,112px);height:clamp(28px,5.6cqw,56px);
+  background-color:var(--chud-muted);
+  -webkit-mask-repeat:no-repeat;mask-repeat:no-repeat;
+  -webkit-mask-position:center;mask-position:center;
+  -webkit-mask-size:contain;mask-size:contain;
+  filter:drop-shadow(0 2px 5px rgba(0,0,0,.5))}
+.chud-lfa.is-active .chud-lfa-lane{background-color:var(--chud-carrot)}
 
 /* WiFi */
 .chud-wifi{height:clamp(24px,4.8cqw,48px);width:clamp(24px,4.8cqw,48px);display:block;color:#fff;
@@ -128,6 +144,16 @@ html:not([data-carrot-mini-hud="1"]) #carrotMiniHud { display:none !important; }
 .chud-t-gap{font-weight:800;fill:#fff;stroke-width:2}
 .chud-t-gear{font-weight:var(--chud-weight);fill:#fff;stroke-width:2}
 .chud-t-set.is-muted,.chud-t-gap.is-muted,.chud-t-gear.is-muted{fill:var(--chud-muted)}
+/* EV 텔테일(항상 초록) / 크루즈 오버라이드(색은 위젯이 mode별 인라인 지정) */
+.chud-t-ev{font-weight:var(--chud-weight);fill:var(--chud-carrot);stroke-width:3}
+.chud-t-override{font-weight:var(--chud-weight);stroke-width:2}
+.chud-t-override-label{font-weight:800;stroke-width:2}
+/* 주행모드 배지(연비/안전/일반/고속) — 색은 위젯이 mode별 인라인(fill), 배경 α는 여기서(200/255) */
+.chud-drive-mode-box{fill-opacity:.784;stroke:#fff;stroke-width:2;stroke-linejoin:round}
+/* 흰 글자 + 두꺼운 어두운 외곽선으로 어느 배경(흰 '일반' 포함)에서도 또렷·강조. */
+.chud-drive-mode-label{font-family:var(--chud-font);font-weight:var(--chud-weight);fill:#fff;
+  paint-order:stroke;stroke:var(--chud-stroke);stroke-width:3;stroke-linejoin:round;
+  letter-spacing:.02em}
 .chud-gear-box{fill:rgba(5,9,12,.82);stroke:#fff;stroke-width:3}
 .chud-gear-box.is-muted{stroke:var(--chud-muted)}
 .chud-speed-traffic{overflow:visible}
@@ -149,11 +175,15 @@ html:not([data-carrot-mini-hud="1"]) #carrotMiniHud { display:none !important; }
 /* 작은 영상 영역에서는 축소 한계만 소폭 키워 가독성을 확보한다.
  * 커진 결과가 다른 존을 침범하면 layout.js가 낮은 우선순위부터 제거한다. */
 @container chud (max-width:520px){
-  .chud-gauge,.chud-level{width:clamp(38px,14cqw,54px)}
+  .chud-gauge,.chud-level{width:clamp(44px,16cqw,64px)}
   .chud-lfa-img{width:clamp(32px,12cqw,46px);height:clamp(32px,12cqw,46px)}
+  .chud-lfa-lane{width:clamp(64px,24cqw,92px);height:clamp(32px,12cqw,46px)}
+  .chud-lfa.has-lane{padding-inline:clamp(16px,6cqw,23px)}
   .chud-wifi{width:clamp(28px,10cqw,40px);height:clamp(28px,10cqw,40px)}
   .chud-clock{font-size:clamp(28px,10cqw,40px);height:clamp(28px,10cqw,40px)}
   .chud-limit{width:clamp(52px,16cqw,68px)}
+  /* 이 구간은 제한속도 표지가 커져 밴드 중심이 내려가므로 topCenter 하강값을 보정. */
+  .chud-zone--tc{padding-top:clamp(60px,15cqw,86px)}
   .chud-turn{width:clamp(132px,42cqw,200px)}
   .chud-speed{width:clamp(188px,68cqw,208px)}
 }
