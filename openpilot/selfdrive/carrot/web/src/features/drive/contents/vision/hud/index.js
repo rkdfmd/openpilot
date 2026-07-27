@@ -10,6 +10,7 @@ import { injectStyle } from "./style.js";
 import { applyHudDegradation, createHudLayoutObserver } from "./layout.js";
 import { createSpeedPanel } from "./widgets/speed_panel.js";
 import { createSpeedLimitSign } from "./widgets/speed_limit_sign.js";
+import { createDriveModeBadge } from "./widgets/drive_mode.js";
 import { createClock } from "./widgets/clock.js";
 import { createWifiIcon } from "./widgets/wifi_icon.js";
 import { createLfaIcon } from "./widgets/lfa_icon.js";
@@ -19,6 +20,7 @@ import { createTurnSignal } from "./widgets/turn_signal.js";
 import { createLevelGauge } from "./widgets/level_gauge.js";
 import { createTpmsBadge } from "./widgets/tpms_badge.js";
 import { CarrotHudDataBridge } from "./data_bridge.js";
+import { createHudDebugFacade } from "./debug.js";
 import { COLORS } from "./tokens.js";
 import { el } from "./dom.js";
 
@@ -34,7 +36,10 @@ function num(value) {
 // 실 payload(js/realtime/vision_raw.js):
 //  vEgoKph, vSetKph, tfGap, gear, gearStep, speedLimitKph, isMetric, driveMode...
 // 속도류는 항상 kph로 옴 → isMetric=false면 mph 변환.
-function mapPayload(p = {}) {
+// Exported for tests: the single normalization every HUD payload passes through,
+// shared identically by live (당근비전) and replay (both feed RAW_HUD_STATE →
+// deriveCompactHudPayload → CarrotHudOverlay.update → mapPayload → widgets).
+export function mapPayload(p = {}) {
   const metric = p.isMetric !== false;
   const toUnit = (kph) => (kph == null ? null : Math.round(metric ? kph : kph * 0.621371));
   const speed = num(p.vEgoKph ?? p.speed);
@@ -45,6 +50,8 @@ function mapPayload(p = {}) {
   const gear = gearStep != null && gearStep > 0
     ? String(Math.round(gearStep))
     : (p.gear == null ? null : String(p.gear).trim().toUpperCase().slice(0, 2));
+  const override = p.cruiseOverride && typeof p.cruiseOverride === "object" ? p.cruiseOverride : null;
+  const overrideKph = override != null ? num(override.kph) : null;
   return {
     speed: toUnit(speed),
     // 크루즈 off면 0/음수로 오므로 숨김
@@ -52,6 +59,13 @@ function mapPayload(p = {}) {
     gap: gap != null && gap > 0 ? Math.round(gap) : null,
     gear,
     speedLimit: limit != null && limit > 0 ? toUnit(limit) : null,
+    // 클러스터 패리티: EV 텔테일 / LFA 레인 초록 날개 / 크루즈 오버라이드(감속=주황·eco=초록)
+    evActive: p.evActive === true,
+    activeLaneLine: p.activeLaneLine === true,
+    cruiseOverride: overrideKph != null && overrideKph > 0
+      ? { kph: toUnit(overrideKph), label: override.label == null ? "" : String(override.label), mode: num(override.mode) ?? 0 }
+      : null,
+    drivingMode: num(p.drivingMode),
     lfaActive: p.latActive ?? p.lfaActive,
     steerAngle: num(p.steeringAngleDeg),
     accel: num(p.aEgo ?? p.accel),
@@ -76,6 +90,9 @@ export function createHudOverlay(doc) {
   const clock = createClock(doc);
   const limit = createSpeedLimitSign(doc);
   const speed = createSpeedPanel(doc);
+  // 주행모드 배지는 패널 좌표(클러스터 1:1)에 얹으므로 speed 패널 SVG 안에 마운트한다.
+  const driveMode = createDriveModeBadge(doc);
+  speed.el.appendChild(driveMode.el);
   const accel = createAccelGauge(doc);
   const steer = createSteerGauge(doc);
   const fuel = createLevelGauge(doc, {
@@ -110,9 +127,28 @@ export function createHudOverlay(doc) {
     bottomRight: zoneBR,
   };
 
-  const widgets = [lfa, wifi, clock, limit, speed, accel, steer, fuel, def, tpms, turn];
+  const widgets = [lfa, wifi, clock, limit, speed, driveMode, accel, steer, fuel, def, tpms, turn];
+  const suppressions = new Set();
   let visibilitySignature = "";
   let layoutObserver = null;
+  let active = false;
+  let destroyed = false;
+  let lastData = null;
+
+  function syncVisibility() {
+    const hidden = destroyed || !active || suppressions.size > 0;
+    root.hidden = hidden;
+    root.inert = hidden;
+    root.classList.toggle("is-hud-suppressed", hidden);
+    if (hidden) {
+      root.setAttribute("aria-hidden", "true");
+      clock.stop();
+    } else {
+      root.removeAttribute("aria-hidden");
+      clock.start();
+    }
+    return !hidden;
+  }
 
   function applyLayout() {
     applyHudDegradation(root, layoutZones);
@@ -124,12 +160,16 @@ export function createHudOverlay(doc) {
   }
 
   function update(payload) {
+    if (destroyed || !payload) return false;
     const data = mapPayload(payload);
+    lastData = data;
     for (const w of widgets) w.update(data);
     const nextVisibilitySignature = [
       data.speedLimit != null && data.speedLimit > 0,
       data.leftBlinker,
       data.rightBlinker,
+      // 레인 날개는 LFA 폭을 바꾸므로 등장/소멸 시 재배치 판정이 필요하다.
+      data.activeLaneLine,
       data.fuelGauge != null && data.fuelGauge > 0 && data.fuelGauge <= 1,
       data.ureaGauge != null && data.ureaGauge > 0 && data.ureaGauge <= 1,
     ].join(":");
@@ -137,23 +177,84 @@ export function createHudOverlay(doc) {
       visibilitySignature = nextVisibilitySignature;
       scheduleLayout();
     }
+    return true;
   }
 
   function relayout(viewport) {
+    if (destroyed) return false;
     const width = num(viewport?.width);
     const height = num(viewport?.height);
-    if (width > 0 && height > 0) scheduleLayout();
+    if (width > 0 && height > 0) {
+      scheduleLayout();
+      return true;
+    }
+    return false;
   }
 
   function startLayout(target) {
+    if (destroyed) return false;
     if (!layoutObserver) layoutObserver = createHudLayoutObserver(root, applyLayout, target);
     layoutObserver?.schedule();
+    return Boolean(layoutObserver);
   }
 
+  function activate() {
+    if (destroyed) return false;
+    const changed = !active;
+    active = true;
+    syncVisibility();
+    scheduleLayout();
+    return changed;
+  }
+
+  function deactivate() {
+    if (destroyed) return false;
+    const changed = active;
+    active = false;
+    syncVisibility();
+    return changed;
+  }
+
+  function setSuppressed(reason, value) {
+    if (destroyed) return false;
+    const key = String(reason || "external");
+    if (value) suppressions.add(key);
+    else suppressions.delete(key);
+    return syncVisibility();
+  }
+
+  function status() {
+    return Object.freeze({
+      active,
+      destroyed,
+      visible: !root.hidden,
+      suppressions: Object.freeze(Array.from(suppressions)),
+      data: lastData,
+    });
+  }
+
+  function destroy() {
+    if (destroyed) return false;
+    active = false;
+    destroyed = true;
+    suppressions.clear();
+    layoutObserver?.destroy?.();
+    layoutObserver = null;
+    syncVisibility();
+    root.remove?.();
+    return true;
+  }
+
+  syncVisibility();
   return {
     root,
     update,
     relayout,
+    activate,
+    deactivate,
+    setSuppressed,
+    status,
+    destroy,
     startClock: () => clock.start(),
     stopClock: () => clock.stop(),
     startLayout,
@@ -180,13 +281,26 @@ export function installCarrotHudOverlay(target = globalThis, options = {}) {
   const overlay = createHudOverlay(doc);
   stage.appendChild(overlay.root);
   overlay.startLayout(target);
-  overlay.startClock();
   overlay.update({});
 
   // 좌표는 DriveVisionViewport가 단독 소유한다. HUD는 공통 결과만 소비한다.
-  target.addEventListener?.("carrot:viewportlayout", (event) => overlay.relayout(event.detail), { passive: true });
+  const handleViewportLayout = (event) => overlay.relayout(event.detail);
+  target.addEventListener?.("carrot:viewportlayout", handleViewportLayout, { passive: true });
+  const destroyOverlay = overlay.destroy;
+  overlay.destroy = () => {
+    target.removeEventListener?.("carrot:viewportlayout", handleViewportLayout);
+    const changed = destroyOverlay();
+    if (changed) {
+      installed.delete(target);
+      if (target.CarrotHudOverlay === overlay) target.CarrotHudOverlay = null;
+      if (target.CarrotHudDebug) target.CarrotHudDebug = null;
+    }
+    return changed;
+  };
 
   target.CarrotHudOverlay = overlay;
+  target.CarrotHudDebug = createHudDebugFacade(target, overlay);
   installed.set(target, overlay);
+  target.DriveVisionHudContent?.syncPresentation?.();
   return overlay;
 }

@@ -5,6 +5,7 @@ var setCarrotVisionState = window.CarrotVisionSetState;
 
 let LAST_HUD_PAYLOAD_SIGNATURE = "";
 const COMPACT_FIRST_DATA_TIMEOUT_MS = 8000;
+let HUD_CRUISE_OVERRIDE_HOLD = null;
 
 const RAW_HUD_SERVICES = window.CarrotVisionCompact?.HUD_SERVICES || [];
 const RAW_HUD_STATE = Object.create(null);
@@ -52,15 +53,20 @@ let COMPACT_OVERLAY_REQUESTED = false;
 let COMPACT_FIRST_DATA_T = null;
 const MODEL_FRAME_HISTORY = [];
 const MODEL_FRAME_HISTORY_LIMIT = 64;
+const ROAD_FRAME_HISTORY = [];
+const ROAD_FRAME_HISTORY_LIMIT = 96;
 const RTP_FRAME_HISTORY = new Map();
 const RTP_FRAME_HISTORY_LIMIT = 96;
 let PRESENTED_VIDEO_FRAME_ID = null;
 let LAST_PRESENTED_RTP_TIMESTAMP = null;
 
 function publishPresentedFrame(detail = {}) {
+  const frame = presentedRoadFrame(PRESENTED_VIDEO_FRAME_ID);
   return window.DriveVisionPresentedFrames?.publish?.({
     ...detail,
     frameId: Number.isFinite(PRESENTED_VIDEO_FRAME_ID) ? PRESENTED_VIDEO_FRAME_ID : null,
+    cameraTimestampEof: frame?.timestampEof ?? null,
+    clockMappingConfidence: frame?.confidence ?? "unmapped",
   }) || null;
 }
 
@@ -100,6 +106,41 @@ function notePresentedVideoFrame(metadata) {
       : null;
   }
   publishPresentedFrame({ source: "live", metadata: metadata || null });
+}
+
+function rememberRoadCameraFrame(cameraState) {
+  const frameId = Number(cameraState?.frameId);
+  const timestampEof = Number(cameraState?.timestampEof);
+  if (!Number.isFinite(frameId) || !Number.isFinite(timestampEof) || timestampEof <= 0) return;
+  const sample = Object.freeze({ frameId, timestampEof });
+  const previous = ROAD_FRAME_HISTORY[ROAD_FRAME_HISTORY.length - 1];
+  if (previous?.frameId === frameId) ROAD_FRAME_HISTORY[ROAD_FRAME_HISTORY.length - 1] = sample;
+  else {
+    ROAD_FRAME_HISTORY.push(sample);
+    if (ROAD_FRAME_HISTORY.length > ROAD_FRAME_HISTORY_LIMIT) ROAD_FRAME_HISTORY.shift();
+  }
+}
+
+function presentedRoadFrame(frameIdValue) {
+  const frameId = Number(frameIdValue);
+  if (!Number.isFinite(frameId) || !ROAD_FRAME_HISTORY.length) return null;
+  let nearest = null;
+  for (let index = ROAD_FRAME_HISTORY.length - 1; index >= 0; index -= 1) {
+    const candidate = ROAD_FRAME_HISTORY[index];
+    if (candidate.frameId === frameId) {
+      return Object.freeze({ ...candidate, confidence: "exact-frame" });
+    }
+    if (!nearest || Math.abs(candidate.frameId - frameId) < Math.abs(nearest.frameId - frameId)) {
+      nearest = candidate;
+    }
+  }
+  const frameGap = frameId - nearest.frameId;
+  if (Math.abs(frameGap) > 3) return null;
+  return Object.freeze({
+    frameId,
+    timestampEof: nearest.timestampEof + frameGap * 50_000_000,
+    confidence: "estimated-frame",
+  });
 }
 
 function noteReplayPresentedFrame(metadata = {}) {
@@ -147,6 +188,7 @@ function selectSynchronizedModel() {
 
 function resetFrameSynchronization() {
   MODEL_FRAME_HISTORY.length = 0;
+  ROAD_FRAME_HISTORY.length = 0;
   RTP_FRAME_HISTORY.clear();
   PRESENTED_VIDEO_FRAME_ID = null;
   LAST_PRESENTED_RTP_TIMESTAMP = null;
@@ -179,7 +221,16 @@ function compactStateActive() {
   return COMPACT_OVERLAY_READY;
 }
 
+function recordedReplayActive() {
+  return Boolean(window.CarrotVisionReplay?.isActive?.());
+}
+
 function compactDesiredServices() {
+  // Recorded replay owns the whole compact-state timeline. Keeping the live
+  // socket open here lets current-device carrotNavi/cameraOdometry samples
+  // overwrite recorded samples between replay records, which presents as AR
+  // blinking and impossible clock-age jumps.
+  if (recordedReplayActive()) return [];
   const services = [];
   if (shouldRunCarrotHudData()) services.push(...RAW_HUD_SERVICES);
   if (
@@ -220,6 +271,7 @@ function applyCompactFrame(service, decoded, options = {}) {
   }
   if (isOverlayStateService(service)) {
     if (service === "modelV2") rememberModelFrame(decoded);
+    if (service === "roadCameraState") rememberRoadCameraFrame(decoded);
     RAW_OVERLAY_STATE[service] = decoded;
     window.CarrotOverlayState = RAW_OVERLAY_STATE;
     if (options.updateVisionState !== false) {
@@ -231,7 +283,7 @@ function applyCompactFrame(service, decoded, options = {}) {
   // Vision owns the latency-sensitive presentation request. Schedule it before
   // notifying auxiliary data consumers so an insights subscriber can never
   // delay the camera overlay's place in the browser task queue.
-  if (applied && options.render !== false) {
+  if (applied && options.render !== false && (hudDirty || overlayDirty)) {
     emitCarrotRenderRequest({
       hudDirty,
       overlayDirty,
@@ -291,7 +343,7 @@ function applyCompactFrames(frames, options = {}) {
       },
     }, { reason: options.reason || "compact batch", silent: true });
   }
-  if (applied && options.render !== false) {
+  if (applied && options.render !== false && (hudReady || overlayDirty)) {
     emitCarrotRenderRequest({ hudDirty: hudReady, overlayDirty });
   }
   // A decoded websocket/replay batch is one coherent state transition. Publish
@@ -347,7 +399,7 @@ function drivingHudUpdateFromCarPayload(j) {
     ? Boolean(Number(j.isMetric))
     : (runtimeIsMetric == null ? true : Boolean(Number(runtimeIsMetric)));
   const vEgoKph = (typeof j.vEgo === "number" && isFinite(j.vEgo)) ? j.vEgo * 3.6 : null;
-  const payload = {
+  const basePayload = {
     isMetric,
     cpuTempC: j.cpuTempC,
     memPct: j.memPct,
@@ -379,6 +431,15 @@ function drivingHudUpdateFromCarPayload(j) {
     speedLimitBlink: j.speedLimitBlink,
     apm: j.apm,
   };
+  const payload = window.CarrotHudDataBridge?.withVehicleHudFields?.(basePayload, j) || {
+    ...basePayload,
+    evActive: j.evActive === true,
+    activeLaneLine: j.activeLaneLine == null ? null : j.activeLaneLine === true,
+    cruiseOverride: j.cruiseOverride && typeof j.cruiseOverride === "object"
+      ? j.cruiseOverride
+      : null,
+  };
+  payload.cruiseOverride = stabilizedHudCruiseOverride(payload.cruiseOverride, payload);
 
   const miniHudPayload = window.CarrotMiniHudModel?.build?.(
     payload,
@@ -405,6 +466,13 @@ function drivingHudUpdateFromCarPayload(j) {
     payload.tfBars ?? "-",
     payload.gear ?? "-",
     payload.gearStep ?? "-",
+    window.CarrotHudDataBridge?.vehicleHudSignature?.(payload) || [
+      payload.evActive ? 1 : 0,
+      payload.activeLaneLine == null ? "-" : (payload.activeLaneLine ? 1 : 0),
+      payload.cruiseOverride?.kph ?? "-",
+      payload.cruiseOverride?.label ?? "-",
+      payload.cruiseOverride?.mode ?? "-",
+    ].join(":"),
     payload.lfaActive ? 1 : 0,
     Math.round(Number(payload.steeringAngleDeg) || 0), // 1° 단위로만 갱신
     Math.round((Number(payload.aEgo) || 0) * 20),      // 0.05 단위
@@ -428,10 +496,51 @@ function drivingHudUpdateFromCarPayload(j) {
   ].join("|");
   if (payloadSignature === LAST_HUD_PAYLOAD_SIGNATURE) return;
   LAST_HUD_PAYLOAD_SIGNATURE = payloadSignature;
-  // Both live and replay publish the same normalized payload to independent
-  // presentation sinks. Neither sink wraps or owns the other one's lifecycle.
-  try { window.CarrotHudOverlay?.update?.(payload); } catch {}
-  try { window.DriveVisionHudContent?.update?.(payload); } catch {}
+  // DriveVisionHudContent owns the visible HUD lifecycle. The direct overlay
+  // fallback is only for a partial/failed platform bootstrap.
+  try {
+    if (window.DriveVisionHudContent?.update) window.DriveVisionHudContent.update(payload);
+    else window.CarrotHudOverlay?.update?.(payload);
+  } catch {}
+}
+
+function hudCruiseOverrideClock() {
+  const replay = window.CarrotVisionReplay?.status?.();
+  const replayTime = Number(replay?.currentTime);
+  if (replay?.active === true && Number.isFinite(replayTime)) {
+    return {
+      clockMs: replayTime * 1000,
+      clockKey: `replay:${replay.route || ""}:${replay.segment || ""}`,
+    };
+  }
+  const clockMs = Number(window.performance?.now?.());
+  return {
+    clockMs: Number.isFinite(clockMs) ? clockMs : Date.now(),
+    clockKey: "live",
+  };
+}
+
+function hudCruiseDisplayVisible(payload) {
+  const hasRawCruiseState = Object.prototype.hasOwnProperty.call(RAW_HUD_STATE, "carState")
+    || Object.prototype.hasOwnProperty.call(RAW_HUD_STATE, "controlsState")
+    || Object.prototype.hasOwnProperty.call(RAW_HUD_STATE, "selfdriveState");
+  const sharedGate = window.CarrotHudDataBridge?.isCruiseDisplayVisible;
+  if (hasRawCruiseState && typeof sharedGate === "function") {
+    return sharedGate(RAW_HUD_STATE);
+  }
+  const setSpeed = Number(payload?.vSetKph);
+  return Number.isFinite(setSpeed) && setSpeed > 0 && setSpeed < 250;
+}
+
+function stabilizedHudCruiseOverride(value, payload) {
+  if (!HUD_CRUISE_OVERRIDE_HOLD) {
+    HUD_CRUISE_OVERRIDE_HOLD = window.CarrotHudDataBridge?.createCruiseOverrideHold?.() || null;
+  }
+  if (!HUD_CRUISE_OVERRIDE_HOLD) return value;
+  return HUD_CRUISE_OVERRIDE_HOLD.update(value, {
+    ...hudCruiseOverrideClock(),
+    active: hudCruiseDisplayVisible(payload),
+  });
 }
 
 function averageFiniteMetric(values) {
@@ -535,13 +644,28 @@ function compactHudSpeedLimitKph(state) {
 
 function compactHudTemp(state) {
   const desiredSpeed = Number(state?.carrotMan?.desiredSpeed);
-  const vCruise = Number(state?.carState?.vCruiseCluster ?? state?.controlsState?.vCruiseCluster);
+  const vCruise = compactHudCruiseKph(state);
   if (!Number.isFinite(desiredSpeed)) return null;
   return {
     speed: desiredSpeed,
     source: Number.isFinite(vCruise) && desiredSpeed >= vCruise ? (state?.carrotMan?.desiredSource || "") : "",
     is_decel: Number.isFinite(vCruise) ? desiredSpeed < vCruise : false,
   };
+}
+
+function compactHudCruiseKph(state) {
+  const sharedResolver = window.CarrotHudDataBridge?.resolveCruiseKph;
+  if (typeof sharedResolver === "function") return sharedResolver(state);
+  for (const value of [
+    state?.carState?.vCruiseCluster,
+    state?.carState?.vCruise,
+    state?.controlsState?.vCruiseCluster,
+    state?.controlsState?.vCruise,
+  ]) {
+    const number = Number(value);
+    if (Number.isFinite(number) && number > 0 && number < 250) return number;
+  }
+  return null;
 }
 
 function compactHudGear(state) {
@@ -569,17 +693,20 @@ function deriveCompactHudPayload(state) {
     && Number.isFinite(Number(carState?.gearStep)) && Number(carState.gearStep) > 0
     ? Math.round(Number(carState.gearStep))
     : null;
-  const trafficState = Number(carrotMan?.trafficState ?? state?.longitudinalPlan?.trafficState);
   const vehiclePayload = window.CarrotHudDataBridge?.deriveVehicleHudPayload?.(state) || {};
-  return {
+  const trafficState = Number(vehiclePayload.trafficState);
+  const cruiseKph = compactHudCruiseKph(state);
+  const payload = {
     cpuTempC,
     memPct: Number(deviceState?.memoryUsagePercent),
     diskPct: null,
     voltageV: Number.isFinite(voltageMv) ? voltageMv / 1000.0 : null,
     vEgo,
-    vSetKph: Number(carState?.vCruiseCluster ?? controlsState?.vCruiseCluster),
+    vSetKph: cruiseKph,
     temp: compactHudTemp(state),
     redDot: false,
+    // 구 hud_renderer/mini HUD용 문자열. 신규 오버레이용 numeric trafficState 등
+    // 클러스터 전용 필드는 아래 withVehicleHudFields 가 vehiclePayload 로부터 일괄 채운다.
     tlight: trafficState === 1 ? "red" : (trafficState === 2 ? "green" : "off"),
     tfGap,
     tfBars: tfGap,
@@ -601,6 +728,20 @@ function deriveCompactHudPayload(state) {
     speedLimitBlink: Number.isFinite(Number(carrotMan?.xSpdLimit)) && Number(carrotMan.xSpdLimit) > 0
       && Number(carrotMan?.xSpdType) !== 22 && Number(carrotMan?.xSpdType) !== 4,
     apm: Number(carrotMan?.activeCarrot) >= 2 ? "APN" : (Number(carrotMan?.activeCarrot) >= 1 ? "APM" : ""),
+  };
+
+  // 클러스터 전용 필드(evActive/activeLaneLine/cruiseOverride/trafficState/drivingMode)를
+  // 한 곳에서 채워 "한 필드만 누락" 회귀를 원천 차단한다(이전 trafficState 누락처럼).
+  // 브리지 미로드 시(부팅 극초기) 동등한 폴백으로 채운다.
+  const withVehicleHudFields = window.CarrotHudDataBridge?.withVehicleHudFields;
+  if (typeof withVehicleHudFields === "function") return withVehicleHudFields(payload, vehiclePayload);
+  return {
+    ...payload,
+    evActive: vehiclePayload.evActive === true,
+    activeLaneLine: vehiclePayload.activeLaneLine == null ? null : vehiclePayload.activeLaneLine === true,
+    cruiseOverride: vehiclePayload.cruiseOverride ?? null,
+    trafficState: Number.isFinite(trafficState) ? trafficState : 0,
+    drivingMode: vehiclePayload.drivingMode ?? null,
   };
 }
 
@@ -679,6 +820,10 @@ function compactOverlayConnect() {
 
   ws.onmessage = async (event) => {
     try {
+      // A Blob conversion may complete after replay has started and the socket
+      // has been closed. Reject both sides of that async boundary so no late
+      // live sample can leak into recorded state.
+      if (recordedReplayActive()) return;
       if (typeof event.data === "string") {
         const hello = JSON.parse(event.data);
         if (hello?.mode !== COMPACT_STATE_MODE) {
@@ -687,6 +832,7 @@ function compactOverlayConnect() {
         return;
       }
       const data = event.data instanceof Blob ? await event.data.arrayBuffer() : event.data;
+      if (recordedReplayActive()) return;
       const frames = window.CarrotVisionCompact?.decodeFrames?.(data)
         || [window.CarrotVisionCompact?.decodeFrame?.(data)].filter(Boolean);
       const applied = applyCompactFrames(frames, { reason: "compact websocket batch" });

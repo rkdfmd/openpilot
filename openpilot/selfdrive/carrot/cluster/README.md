@@ -1,8 +1,8 @@
 # Carrot Cluster
 
-Standalone raylib cluster UI bundle for openpilot devices. Live and replay views
-show tire pressures beside the ego vehicle's four wheel positions when TPMS data
-is available; pressures below 31 psi are highlighted in red.
+Standalone raylib cluster UI bundle for openpilot devices. The normal and road
+camera HUDs show available tire pressures around a fixed vehicle diagram beside
+the navigation panel; pressures below 31 psi are highlighted in red.
 
 Run from the openpilot root:
 
@@ -354,6 +354,20 @@ invalid samples, and stale `carState` data.
 Hyundai/Kia CAN-FD hybrids enable this capability only when both `0xFA` and
 `0x230` are present on ECAN with DLC32. The four-bit power-flow mode in `0x230`
 shows `EV` for observed values 1, 2, and 6; all other values remain hidden.
+The normal HUD also shows the current `longitudinalPlan.myDrivingMode` beside
+the model traffic-state icon above vehicle speed: `1` eco in green, `2` safe
+in orange, `3` normal in white, and `4` high speed in red. Unknown modes and
+missing, invalid, or stale longitudinal plans hide the badge. The red and
+green traffic-state icons share the slot immediately to its left and remain
+independent of driving mode. Full navigation mode omits both speed-mode
+indicators.
+The normal and road camera HUDs use the same fixed TPMS diagram below the
+acceleration, steering, fuel, and DEF gauges. It remains hidden only when all
+four pressure values are unavailable; individual missing values show `--`, and
+values below 31 psi are red. The surrounding area stays transparent. When
+external navigation is active or its dashboard is connected, the green `NAV`
+status appears below the Wi-Fi icon instead of the former lower-right `NAVI`
+label. The center clock, EV indicator, and fuel/DEF gauges are unchanged.
 When `--fps` is omitted, `ClusterHudLiveFps` controls the render limit and is
 polled about once per second while running: `0` uncapped diagnostic mode, `1`
 10 Hz default, `2` 20 Hz, `3` 30 Hz, `4` 40 Hz, `5` 50 Hz, and `6` 60 Hz.

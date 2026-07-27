@@ -12,8 +12,10 @@ from cluster_models import ModelPathPoint
 from cluster_route_replay import (
   RawCornerObject,
   RouteLogParser,
+  StableCornerObjectTracker,
   adjacent_route_log_path,
   blend_frames,
+  corner_track_label,
   frame_to_state,
   model_lead_detections_from_model_v2,
 )
@@ -48,6 +50,12 @@ def radar_lead(track_id, d_rel=25.0, y_rel=2.0):
   )
 
 
+def test_corner_430_track_labels_preserve_radar_group():
+  assert corner_track_label(300, "corner430") == "CR430_000"
+  assert corner_track_label(411, "corner430") == "CR430_111"
+  assert corner_track_label(1204, "corner430") == "CR430_T1204"
+
+
 def test_replay_uses_raw_object_identity_when_corner_slot_is_reused():
   parser = RouteLogParser()
   old_object = corner_object(13.969, 2, 108, 255, 3.6, -4.65, -4.10, -0.20)
@@ -71,6 +79,20 @@ def test_replay_uses_raw_object_identity_when_corner_slot_is_reused():
   )))
 
   assert moved_track_id == new_track_id
+
+
+def test_reconstructed_corner_tracks_include_filtered_lead_dynamics():
+  tracker = StableCornerObjectTracker()
+  output = ()
+  for index in range(14):
+    t = index * 0.05
+    vx = index * 0.08
+    tracker.update(corner_object(t, 1, 46, index + 1, 12.0 + vx * t, 2.0, vx, 0.0))
+    output = tracker.live_tracks_at(t, 15.0)
+
+  assert len(output) == 1
+  assert output[0].aLead > 0.05
+  assert output[0].jLead != 0.0
 
 
 def test_recorded_cutin_display_requires_current_leads_cutin_membership():
@@ -179,6 +201,20 @@ def test_live_selfdrive_state_passes_event_timestamp():
   assert calls == [(source.sm["selfdriveState"], 12.5)]
 
 
+def test_live_longitudinal_plan_passes_service_validity():
+  calls = []
+  source = object.__new__(OpenpilotLiveSource)
+  source.sm = {"longitudinalPlan": SimpleNamespace(myDrivingMode=2)}
+  source.parser = SimpleNamespace(
+    _update_longitudinal_plan=lambda data, valid: calls.append((data, valid)),
+  )
+  source._service_valid = lambda service: service != "longitudinalPlan"
+
+  source._apply_service_update("longitudinalPlan", 12.5)
+
+  assert calls == [(source.sm["longitudinalPlan"], False)]
+
+
 def test_controls_active_lane_line_reaches_cluster_state():
   parser = RouteLogParser()
   parser._update_controls_state(SimpleNamespace(activeLaneLine=True))
@@ -214,6 +250,40 @@ def test_ev_mode_is_preserved_as_discrete_state_during_replay_interpolation():
 
   assert blend_frames(active, engine, 0.49).ev_mode_active is True
   assert blend_frames(active, engine, 0.50).ev_mode_active is False
+
+
+def test_driving_mode_reaches_cluster_only_for_known_values():
+  parser = RouteLogParser()
+
+  for mode in (1, 2, 3, 4):
+    parser._update_longitudinal_plan(SimpleNamespace(myDrivingMode=mode))
+    frame = parser._frame_from_car_state(SimpleNamespace(), float(mode))
+    assert frame.driving_mode == mode
+    assert frame_to_state(frame).driving_mode == mode
+
+  for invalid_mode in (0, -1, 5, None):
+    parser._update_longitudinal_plan(SimpleNamespace(myDrivingMode=invalid_mode))
+    frame = parser._frame_from_car_state(SimpleNamespace(), 10.0)
+    assert frame.driving_mode is None
+    assert frame_to_state(frame).driving_mode is None
+
+  parser._update_longitudinal_plan(SimpleNamespace())
+  assert parser._frame_from_car_state(SimpleNamespace(), 11.0).driving_mode is None
+
+  parser._update_longitudinal_plan(SimpleNamespace(myDrivingMode=2), valid=False)
+  assert parser._frame_from_car_state(SimpleNamespace(), 12.0).driving_mode is None
+
+
+def test_driving_mode_is_held_between_plan_updates_and_blended_discretely():
+  parser = RouteLogParser()
+  parser._update_longitudinal_plan(SimpleNamespace(myDrivingMode=1))
+  eco = parser._frame_from_car_state(SimpleNamespace(), 0.0)
+  held = parser._frame_from_car_state(SimpleNamespace(), 0.01)
+  high = replace(eco, t=1.0, driving_mode=4)
+
+  assert held.driving_mode == 1
+  assert blend_frames(eco, high, 0.49).driving_mode == 1
+  assert blend_frames(eco, high, 0.50).driving_mode == 4
 
 
 def test_lane_change_animation_keeps_target_floor_and_lane_grid_without_blinker():
