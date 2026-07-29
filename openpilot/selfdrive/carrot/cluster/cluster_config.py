@@ -54,6 +54,7 @@ CLUSTER_ENCODER_SOFTWARE = 3
 CLUSTER_HUD_PARAM = "ClusterHud"
 CLUSTER_HUD_DEBUG_PARAM = "ClusterHudDebug"
 CLUSTER_BRIGHTNESS_PARAM = "ClusterHudBrightness"
+CLUSTER_ORIENTATION_PARAM = "ClusterHudOrientation"
 CLUSTER_ENCODER_PARAM = "ClusterHudEncoder"
 CLUSTER_HUD_MIRROR_PARAM = "ClusterHudMirror"
 CLUSTER_CORE_MODE_PARAM = "ClusterHudCoreMode"
@@ -143,7 +144,8 @@ LIGHT_CLUSTER_THEME = ClusterTheme(
 DARK_CLUSTER_THEME = ClusterTheme(
     name="dark",
     is_dark=True,
-    bg=(7, 10, 14),
+    # Match the map and disconnected backings on wide external displays.
+    bg=(0, 0, 0),
     panel_bg=(18, 23, 29),
     text=(238, 242, 247),
     muted=(150, 160, 172),

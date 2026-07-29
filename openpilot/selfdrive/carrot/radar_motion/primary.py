@@ -4,11 +4,13 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, replace
 from typing import Any
 
 from openpilot.selfdrive.carrot.radar_motion.predictor import (
+  MIN_PREDICTED_PATH_OVERLAP_S,
+  RadarMotionPrediction,
   project_to_model_path,
 )
 
@@ -21,19 +23,36 @@ VISION_MATCH_DISTANCE_HYSTERESIS_M = 2.0
 VISION_MATCH_FRESH_MIN_SCORE = 1.0e-4
 VISION_MATCH_FRESH_MAX_DPATH_M = 2.0
 VISION_MATCH_HELD_MAX_DPATH_M = 4.0
+VISION_MATCH_XSTD_SIGMA = 2.5
+VISION_MATCH_XSTD_MAX_M = 15.0
 PRIMARY_RADAR_SOURCES = frozenset(("frontRadar", "scc"))
 LOW_SPEED_SCC_MAX_VLEAD_MPS = 5.0
-STATIONARY_VISION_MIN_PROB = 0.05
+STATIONARY_VISION_MIN_PROB = 0.40
+STATIONARY_FRONT_MIN_VISION_SUPPORT_FRAMES = 3
 STATIONARY_CONFIRMATION_S = 0.25
 STATIONARY_MAX_ABS_VLEAD_MPS = 2.5
 STATIONARY_MAX_VISION_SPEED_DELTA_MPS = 10.0
 STATIONARY_FRESH_MAX_DPATH_M = 2.0
 STATIONARY_HELD_MAX_DPATH_M = 4.0
+STATIONARY_VISION_PATH_OUTLIER_MAX_DPATH_M = 8.0
+STATIONARY_VISION_PATH_OUTLIER_MIN_PROB = 0.90
+STATIONARY_VISION_PATH_OUTLIER_HOLD_S = 0.20
 STATIONARY_LONGITUDINAL_CONTINUITY_M = 2.5
 STATIONARY_LATERAL_CONTINUITY_M = 1.5
 FRONT_KINEMATIC_MATCH_MAX_DREL_DELTA_M = 5.0
 FRONT_KINEMATIC_MATCH_MAX_YREL_DELTA_M = 0.75
 FRONT_KINEMATIC_MATCH_MAX_VLEAD_DELTA_MPS = 2.0
+FRONT_KINEMATIC_HOLD_MAX_DREL_DELTA_M = 12.0
+FRONT_KINEMATIC_HOLD_MAX_YREL_DELTA_M = 2.0
+FRONT_KINEMATIC_HOLD_MAX_VLEAD_DELTA_MPS = 2.0
+VISION_BRACKET_MIN_PROB = 0.90
+VISION_BRACKET_MAX_RANGE_GAP_M = 20.0
+VISION_BRACKET_MAX_SPEED_DELTA_MPS = 2.0
+VISION_BRACKET_MAX_ABS_DPATH_M = 3.0
+VISION_BRACKET_MIN_INWARD_RATE_MPS = 0.10
+VISION_BRACKET_MIN_HISTORY_S = 1.0
+VISION_BRACKET_MIN_INWARD_TRAVEL_M = 0.15
+VISION_BRACKET_MIN_MOTION_SUPPORT = 0.70
 
 
 def _finite(value: Any, fallback: float = 0.0) -> float:
@@ -130,13 +149,58 @@ def _front_kinematic_match_cost(
   )
 
 
+def _front_kinematic_hold_compatible(
+  corner: RadarPointSnapshot,
+  front: RadarPointSnapshot,
+) -> bool:
+  return (
+    abs(corner.d_rel - front.d_rel)
+    <= FRONT_KINEMATIC_HOLD_MAX_DREL_DELTA_M
+    and abs(corner.y_rel - front.y_rel)
+    <= FRONT_KINEMATIC_HOLD_MAX_YREL_DELTA_M
+    and abs(corner.v_lead - front.v_lead)
+    <= FRONT_KINEMATIC_HOLD_MAX_VLEAD_DELTA_MPS
+  )
+
+
+def _with_front_radar_kinematics(
+  point: RadarPointSnapshot,
+  front: RadarPointSnapshot,
+) -> RadarPointSnapshot:
+  return RadarPointSnapshot(
+    track_id=point.track_id,
+    source=point.source,
+    d_rel=front.d_rel,
+    y_rel=point.y_rel,
+    v_rel=front.v_rel,
+    a_rel=front.a_rel,
+    yv_rel=point.yv_rel,
+    v_lead=front.v_lead,
+    a_lead=front.a_lead,
+    j_lead=front.j_lead,
+    measured=point.measured and front.measured,
+    kinematics_source=front.source,
+    kinematics_track_id=front.track_id,
+  )
+
+
 def prefer_front_radar_kinematics(
   point: RadarPointSnapshot,
   points: Iterable[RadarPointSnapshot],
+  front_matches: Mapping[
+    tuple[str, int], RadarPointSnapshot
+  ] | None = None,
 ) -> RadarPointSnapshot:
   """Use mutually matched front longitudinal values for a corner track."""
   if not point.source.startswith("corner"):
     return point
+  if front_matches is not None:
+    front = front_matches.get((point.source, point.track_id))
+    return (
+      _with_front_radar_kinematics(point, front)
+      if front is not None
+      else point
+    )
   point_values = tuple(points)
   matches = tuple(
     (cost, front)
@@ -175,20 +239,211 @@ def prefer_front_radar_kinematics(
     or matched_corner.track_id != point.track_id
   ):
     return point
-  return RadarPointSnapshot(
-    track_id=point.track_id,
-    source=point.source,
-    d_rel=front.d_rel,
-    y_rel=point.y_rel,
-    v_rel=front.v_rel,
-    a_rel=front.a_rel,
-    yv_rel=point.yv_rel,
-    v_lead=front.v_lead,
-    a_lead=front.a_lead,
-    j_lead=front.j_lead,
-    measured=point.measured and front.measured,
-    kinematics_source=front.source,
-    kinematics_track_id=front.track_id,
+  return _with_front_radar_kinematics(point, front)
+
+
+class FrontRadarKinematicAssociator:
+  """Keep an established corner/front identity through reflection migration."""
+
+  def __init__(self) -> None:
+    self._pairs: dict[tuple[str, int], tuple[str, int]] = {}
+
+  def reset(self) -> None:
+    self._pairs.clear()
+
+  def update(
+    self,
+    points: Iterable[RadarPointSnapshot],
+  ) -> dict[tuple[str, int], RadarPointSnapshot]:
+    point_values = tuple(points)
+    corners = tuple(
+      point for point in point_values
+      if point.source.startswith("corner")
+    )
+    fronts = tuple(
+      point for point in point_values
+      if point.source == "frontRadar"
+    )
+    point_by_identity = {
+      (point.source, point.track_id): point
+      for point in point_values
+    }
+    best_front_by_corner: dict[
+      tuple[str, int],
+      tuple[float, tuple[str, int]],
+    ] = {}
+    best_corner_by_front: dict[
+      tuple[str, int],
+      tuple[float, tuple[str, int]],
+    ] = {}
+    for corner in corners:
+      corner_identity = corner.source, corner.track_id
+      for front in fronts:
+        cost = _front_kinematic_match_cost(corner, front)
+        if cost is None:
+          continue
+        front_identity = front.source, front.track_id
+        corner_match = (cost, front_identity)
+        current_front = best_front_by_corner.get(corner_identity)
+        if (
+          current_front is None
+          or (corner_match[0], corner_match[1][1])
+          < (current_front[0], current_front[1][1])
+        ):
+          best_front_by_corner[corner_identity] = corner_match
+        front_match = (cost, corner_identity)
+        current_corner = best_corner_by_front.get(front_identity)
+        if (
+          current_corner is None
+          or (front_match[0], front_match[1][1])
+          < (current_corner[0], current_corner[1][1])
+        ):
+          best_corner_by_front[front_identity] = front_match
+    normal_matches: dict[
+      tuple[str, int], RadarPointSnapshot
+    ] = {}
+    for corner_identity, best_front in best_front_by_corner.items():
+      if best_front is None:
+        continue
+      _, front_identity = best_front
+      reverse = best_corner_by_front.get(front_identity)
+      if reverse is None or reverse[1] != corner_identity:
+        continue
+      front = point_by_identity.get(front_identity)
+      if front is not None:
+        normal_matches[corner_identity] = front
+
+    remembered_pairs: dict[
+      tuple[str, int], tuple[str, int]
+    ] = {}
+    for corner_identity, front_identity in self._pairs.items():
+      corner = point_by_identity.get(corner_identity)
+      front = point_by_identity.get(front_identity)
+      if (
+        corner is not None
+        and front is not None
+        and _front_kinematic_hold_compatible(corner, front)
+      ):
+        remembered_pairs[corner_identity] = front_identity
+    remembered_pairs.update({
+      corner_identity: (front.source, front.track_id)
+      for corner_identity, front in normal_matches.items()
+    })
+
+    matches = dict(normal_matches)
+    used_fronts = {
+      (front.source, front.track_id)
+      for front in matches.values()
+    }
+    for corner_identity, front_identity in sorted(remembered_pairs.items()):
+      if (
+        corner_identity in matches
+        or front_identity in used_fronts
+      ):
+        continue
+      corner = point_by_identity.get(corner_identity)
+      front = point_by_identity.get(front_identity)
+      if (
+        corner is None
+        or front is None
+        or not _front_kinematic_hold_compatible(corner, front)
+      ):
+        continue
+      matches[corner_identity] = front
+      used_fronts.add(front_identity)
+
+    self._pairs = remembered_pairs
+    return matches
+
+
+def apply_vision_bracket_cutin_support(
+  prediction: RadarMotionPrediction,
+  point: RadarPointSnapshot,
+  points: Iterable[RadarPointSnapshot],
+  vision: VisionLead | None,
+  lead_one: dict[str, Any] | None,
+) -> RadarMotionPrediction:
+  """Fuse vision existence with a corner track that brackets the primary lead.
+
+  Vision range is not used for control. A mutually matched front point supplies
+  longitudinal radar kinematics while the corner track retains its measured
+  dPath history.
+  """
+  if (
+    not isinstance(prediction, RadarMotionPrediction)
+    or vision is None
+    or vision.probability < VISION_BRACKET_MIN_PROB
+    or lead_one is None
+    or not bool(lead_one.get("status", True))
+    or not point.source.startswith("corner")
+    or prediction.current_path_occupancy
+    or abs(prediction.d_path) > VISION_BRACKET_MAX_ABS_DPATH_M
+    or prediction.predicted_path_overlap_s
+    < MIN_PREDICTED_PATH_OVERLAP_S
+    or prediction.motion_consistency < VISION_BRACKET_MIN_MOTION_SUPPORT
+    or prediction.recent_motion_support < VISION_BRACKET_MIN_MOTION_SUPPORT
+  ):
+    return prediction
+
+  lead_point = prefer_front_radar_kinematics(point, points)
+  if (
+    getattr(lead_point, "kinematics_source", None) != "frontRadar"
+    or getattr(lead_point, "kinematics_track_id", None) is None
+  ):
+    return prediction
+
+  lead_one_d_rel = _finite(lead_one.get("dRel"), math.inf)
+  if not (
+    0.5 < lead_point.d_rel < vision.d_rel < lead_one_d_rel
+    and vision.d_rel - lead_point.d_rel
+    <= VISION_BRACKET_MAX_RANGE_GAP_M
+    and abs(lead_point.v_lead - vision.velocity)
+    <= VISION_BRACKET_MAX_SPEED_DELTA_MPS
+  ):
+    return prediction
+
+  inward_sign = -math.copysign(1.0, prediction.d_path)
+  if (
+    inward_sign * prediction.d_path_rate_short
+    < VISION_BRACKET_MIN_INWARD_RATE_MPS
+    or inward_sign * prediction.d_path_rate_long
+    < VISION_BRACKET_MIN_INWARD_RATE_MPS
+  ):
+    return prediction
+
+  past = min(
+    (
+      sample
+      for sample in prediction.history
+      if sample.age_s >= VISION_BRACKET_MIN_HISTORY_S
+    ),
+    key=lambda sample: sample.age_s,
+    default=None,
+  )
+  if (
+    past is None
+    or abs(past.d_path) - abs(prediction.d_path)
+    < VISION_BRACKET_MIN_INWARD_TRAVEL_M
+  ):
+    return prediction
+
+  fused_probability = min(
+    1.0,
+    vision.probability
+    * prediction.motion_consistency
+    * prediction.recent_motion_support,
+  )
+  return replace(
+    prediction,
+    cut_in_probability=max(
+      prediction.cut_in_probability,
+      fused_probability,
+    ),
+    path_entry_probability=max(
+      prediction.path_entry_probability,
+      fused_probability,
+    ),
+    reason="vision-bracketed physical CUT-IN",
   )
 
 
@@ -277,10 +532,12 @@ class VisionRadarMatcher:
     self.stationary_identity: tuple[str, int] | None = None
     self._stationary_pending_identity: tuple[str, int] | None = None
     self._stationary_pending_since_s: float | None = None
+    self._stationary_pending_vision_support_frames = 0
     self._stationary_last_point: RadarPointSnapshot | None = None
     self._stationary_last_time_s: float | None = None
     self._stationary_seed_probability = 0.0
     self._stationary_seed_score = 0.0
+    self._stationary_path_outlier_since_s: float | None = None
 
   def reset(self) -> None:
     self._reset_moving()
@@ -294,10 +551,12 @@ class VisionRadarMatcher:
     self.stationary_identity = None
     self._stationary_pending_identity = None
     self._stationary_pending_since_s = None
+    self._stationary_pending_vision_support_frames = 0
     self._stationary_last_point = None
     self._stationary_last_time_s = None
     self._stationary_seed_probability = 0.0
     self._stationary_seed_score = 0.0
+    self._stationary_path_outlier_since_s = None
 
   @staticmethod
   def _identity(point: RadarPointSnapshot) -> tuple[str, int]:
@@ -329,8 +588,29 @@ class VisionRadarMatcher:
     d_path: float,
     prefer_corner: bool,
   ) -> float | None:
+    base_cost = VisionRadarMatcher._stationary_vision_base_cost(
+      vision, point,
+    )
+    if base_cost is None:
+      return None
+    return (
+      base_cost
+      + 0.15 * abs(d_path) / STATIONARY_FRESH_MAX_DPATH_M
+      - (
+        0.35
+        if prefer_corner and point.source.startswith("corner")
+        else 0.0
+      )
+    )
+
+  @staticmethod
+  def _stationary_vision_base_cost(
+    vision: VisionLead | None,
+    point: RadarPointSnapshot,
+  ) -> float | None:
     if (
-      vision.probability < STATIONARY_VISION_MIN_PROB
+      vision is None
+      or vision.probability < STATIONARY_VISION_MIN_PROB
       or abs(point.v_lead - vision.velocity)
       > STATIONARY_MAX_VISION_SPEED_DELTA_MPS
     ):
@@ -348,12 +628,6 @@ class VisionRadarMatcher:
     return (
       distance_error / distance_gate
       + lateral_error / lateral_gate
-      + 0.15 * abs(d_path) / STATIONARY_FRESH_MAX_DPATH_M
-      - (
-        0.35
-        if prefer_corner and point.source.startswith("corner")
-        else 0.0
-      )
     )
 
   def _match_stationary(
@@ -363,6 +637,7 @@ class VisionRadarMatcher:
     path: Sequence[tuple[float, float]],
     time_s: float | None,
     prefer_corner: bool,
+    prefer_primary: bool,
   ) -> VisionRadarMatch | None:
     if time_s is None or not math.isfinite(time_s):
       self._reset_stationary()
@@ -375,13 +650,36 @@ class VisionRadarMatcher:
         or abs(point.v_lead) > STATIONARY_MAX_ABS_VLEAD_MPS
       ):
         continue
+      if (
+        identity != self.stationary_identity
+        and identity != self._stationary_pending_identity
+        and self._stationary_vision_base_cost(vision, point) is None
+      ):
+        # A new stationary identity can only enter through vision support.
+        # Reject distance/lateral/speed mismatches before the polyline
+        # projection; active and pending identities still take the exact
+        # continuity path below.
+        continue
       d_path = project_to_model_path(path, point.d_rel, point.y_rel).d_path
       maximum_d_path = (
         STATIONARY_HELD_MAX_DPATH_M
         if identity == self.stationary_identity
         else STATIONARY_FRESH_MAX_DPATH_M
       )
-      if abs(d_path) <= maximum_d_path:
+      held_vision_path_outlier = (
+        identity == self.stationary_identity
+        and vision is not None
+        and vision.probability
+        >= STATIONARY_VISION_PATH_OUTLIER_MIN_PROB
+        and abs(d_path)
+        <= STATIONARY_VISION_PATH_OUTLIER_MAX_DPATH_M
+        and (
+          self._stationary_path_outlier_since_s is None
+          or time_s - self._stationary_path_outlier_since_s
+          <= STATIONARY_VISION_PATH_OUTLIER_HOLD_S
+        )
+      )
+      if abs(d_path) <= maximum_d_path or held_vision_path_outlier:
         candidate_values.append((point, d_path))
     if (
       prefer_corner
@@ -406,6 +704,30 @@ class VisionRadarMatcher:
         )
         if cost is not None:
           supported.append((point, d_path, cost))
+    if (
+      prefer_primary
+      and any(
+        point.source == "frontRadar"
+        for point, _, _ in supported
+      )
+    ):
+      supported = [
+        candidate
+        for candidate in supported
+        if candidate[0].source == "frontRadar"
+      ]
+    elif (
+      prefer_primary
+      and any(
+        point.source == "scc"
+        for point, _, _ in supported
+      )
+    ):
+      supported = [
+        candidate
+        for candidate in supported
+        if candidate[0].source == "scc"
+      ]
 
     selected: tuple[RadarPointSnapshot, float, float] | None = None
     if self.stationary_identity is not None:
@@ -498,24 +820,47 @@ class VisionRadarMatcher:
         return None
 
       selected_identity = self._identity(selected[0])
+      selected_has_vision_support = any(
+        self._identity(point) == selected_identity
+        for point, _, _ in supported
+      )
       if selected_identity != self._stationary_pending_identity:
         self._stationary_pending_identity = selected_identity
         self._stationary_pending_since_s = time_s
+        self._stationary_pending_vision_support_frames = (
+          1 if selected_has_vision_support else 0
+        )
         self._stationary_seed_probability = (
           vision.probability if vision is not None else 0.0
         )
         self._stationary_seed_score = selected[2]
+      elif selected_has_vision_support:
+        self._stationary_pending_vision_support_frames += 1
+      elif not selected[0].source.startswith("corner"):
+        self._stationary_pending_vision_support_frames = 0
       self._stationary_last_point = selected[0]
       self._stationary_last_time_s = time_s
+      required_support_frames = (
+        1
+        if selected[0].source.startswith("corner")
+        else STATIONARY_FRONT_MIN_VISION_SUPPORT_FRAMES
+      )
       if (
         self._stationary_pending_since_s is None
         or time_s - self._stationary_pending_since_s
         < STATIONARY_CONFIRMATION_S
+        or self._stationary_pending_vision_support_frames
+        < required_support_frames
       ):
         return None
       self.stationary_identity = selected_identity
 
     point, d_path, score = selected
+    if abs(d_path) > STATIONARY_HELD_MAX_DPATH_M:
+      if self._stationary_path_outlier_since_s is None:
+        self._stationary_path_outlier_since_s = time_s
+    else:
+      self._stationary_path_outlier_since_s = None
     self.stationary_identity = self._identity(point)
     self._stationary_last_point = point
     self._stationary_last_time_s = time_s
@@ -551,6 +896,21 @@ class VisionRadarMatcher:
       self._reset_moving()
       return None
 
+    velocity_tolerance = max(
+      5.0,
+      abs(vision.velocity) * (
+        0.3
+        + 0.2 * min(max((vision.probability - 0.8) / 0.18, 0.0), 1.0)
+      ),
+    )
+    distance_tolerance = max(
+      5.0,
+      vision.d_rel * 0.25,
+      min(
+        VISION_MATCH_XSTD_MAX_M,
+        abs(vision.x_std) * VISION_MATCH_XSTD_SIGMA,
+      ),
+    )
     candidates: list[tuple[RadarPointSnapshot, float, float, bool]] = []
     for point in points:
       if point.source not in PRIMARY_RADAR_SOURCES:
@@ -561,6 +921,34 @@ class VisionRadarMatcher:
         continue
       if not 0.5 < point.d_rel < 180.0:
         continue
+      score = (
+        _laplacian(point.d_rel, vision.d_rel, vision.x_std)
+        * _laplacian(point.y_rel, vision.y_rel, vision.y_std)
+        * _laplacian(point.v_lead, vision.velocity, vision.v_std)
+      )
+      velocity_error = abs(point.v_lead - vision.velocity)
+      if (
+        (not held_identity and score < VISION_MATCH_FRESH_MIN_SCORE)
+        or abs(point.d_rel - vision.d_rel)
+        >= (
+          distance_tolerance
+          + (
+            VISION_MATCH_DISTANCE_HYSTERESIS_M
+            if held_identity
+            else 0.0
+          )
+        )
+        or abs(point.y_rel - vision.y_rel) >= 2.0
+        or not (
+          velocity_error < velocity_tolerance
+          or (
+            point.v_lead > 3.0
+            and velocity_error
+            < max(velocity_tolerance * 3.0, 20.0)
+          )
+        )
+      ):
+        continue
       projection = project_to_model_path(path, point.d_rel, point.y_rel)
       if abs(projection.d_path) > (
         VISION_MATCH_HELD_MAX_DPATH_M
@@ -568,50 +956,13 @@ class VisionRadarMatcher:
         else VISION_MATCH_FRESH_MAX_DPATH_M
       ):
         continue
-      score = (
-        _laplacian(point.d_rel, vision.d_rel, vision.x_std)
-        * _laplacian(point.y_rel, vision.y_rel, vision.y_std)
-        * _laplacian(point.v_lead, vision.velocity, vision.v_std)
-      )
       candidates.append((point, score, projection.d_path, held_identity))
-
-    velocity_tolerance = max(
-      5.0,
-      abs(vision.velocity) * (
-        0.3
-        + 0.2 * min(max((vision.probability - 0.8) / 0.18, 0.0), 1.0)
-      ),
-    )
-    usable = [
-      candidate for candidate in candidates
-      if (
-        (
-          candidate[3]
-          or candidate[1] >= VISION_MATCH_FRESH_MIN_SCORE
-        )
-        and
-        abs(candidate[0].d_rel - vision.d_rel)
-        < (
-          max(5.0, vision.d_rel * 0.25)
-          + (VISION_MATCH_DISTANCE_HYSTERESIS_M if candidate[3] else 0.0)
-        )
-        and abs(candidate[0].y_rel - vision.y_rel) < 2.0
-        and (
-          abs(candidate[0].v_lead - vision.velocity) < velocity_tolerance
-          or (
-            candidate[0].v_lead > 3.0
-            and abs(candidate[0].v_lead - vision.velocity)
-            < max(velocity_tolerance * 3.0, 20.0)
-          )
-        )
-      )
-    ]
-    if not usable:
+    if not candidates:
       self._reset_moving()
       return None
 
     selected = max(
-      usable,
+      candidates,
       key=lambda candidate: (
         candidate[1],
         -abs(candidate[0].d_rel - vision.d_rel),
@@ -637,6 +988,7 @@ class VisionRadarMatcher:
     time_s: float | None = None,
     stationary_points: Iterable[RadarPointSnapshot] | None = None,
     prefer_corner_stationary: bool = False,
+    prefer_primary_stationary: bool = False,
   ) -> VisionRadarMatch | None:
     vision = vision_lead_from_model(model)
     stationary = self._match_stationary(
@@ -645,6 +997,7 @@ class VisionRadarMatcher:
       path,
       time_s,
       prefer_corner_stationary,
+      prefer_primary_stationary,
     )
     moving = self._match_moving(vision, points, path)
     if (
