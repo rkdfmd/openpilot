@@ -25,6 +25,8 @@ from cluster_config import (
     CLUSTER_HUD_PARAM,
     CLUSTER_LIVE_FPS_PARAM,
     CLUSTER_ORIENTATION_PARAM,
+    CLUSTER_PANEL_LAYOUT_DRIVING_LEFT,
+    CLUSTER_PANEL_LAYOUT_PARAM,
     CLUSTER_PRIORITY_PARAM,
     CLUSTER_RADAR_DISPLAY_PARAM,
     CLUSTER_RADAR_INFO_PARAM,
@@ -43,6 +45,7 @@ from cluster_config import (
     normalize_cluster_core_mode,
     normalize_cluster_encoder_mode,
     normalize_cluster_live_fps,
+    normalize_cluster_panel_layout,
     normalize_cluster_priority,
     normalize_cluster_radar_display_mode,
     normalize_cluster_radar_info_mode,
@@ -55,6 +58,7 @@ from cluster_gamepad import DualSenseSimulator
 from cluster_git_status import GitBranchStatusProvider
 from cluster_gles_dmabuf import DirectNv12DmabufError
 from cluster_gles_readback import DirectNv12ReadbackError
+from cluster_display import CLUSTER_LANGUAGE_KO, normalize_cluster_language, normalize_metric_setting
 from cluster_h264_pipeline import (
     DEFAULT_H264_DEVICE,
     DEFAULT_H264_ENCODER_ALIGN,
@@ -90,10 +94,12 @@ DEFAULT_H264_BITRATE = "auto"
 DEFAULT_H264_GOP = 1
 DEFAULT_H264_DIMENSION_ALIGN = 1
 THEME_PARAM_POLL_SECONDS = 1.0
+DISPLAY_PREF_PARAM_POLL_SECONDS = 1.0
 FPS_PARAM_POLL_SECONDS = 1.0
 BRIGHTNESS_PARAM_POLL_SECONDS = 0.1
 SCREEN_MODE_PARAM_POLL_SECONDS = 1.0
 CAMERA_VIEW_PARAM_POLL_SECONDS = 1.0
+PANEL_LAYOUT_PARAM_POLL_SECONDS = 1.0
 RADAR_PARAM_POLL_SECONDS = 1.0
 HUD_MODE_PARAM_POLL_SECONDS = 1.0
 HUD_MIRROR_PARAM_POLL_SECONDS = 1.0
@@ -236,6 +242,33 @@ class ClusterThemeParamReader:
             return "auto"
 
 
+class ClusterDisplayPreferencesParamReader:
+    def __init__(self) -> None:
+        self._params = None
+        try:
+            from openpilot.common.params import Params
+
+            self._params = Params()
+        except Exception:
+            pass
+
+    def read(self) -> tuple[str, bool]:
+        if self._params is None:
+            return CLUSTER_LANGUAGE_KO, True
+        try:
+            language = normalize_cluster_language(
+                self._params.get("LanguageSetting", return_default=True),
+                default=CLUSTER_LANGUAGE_KO,
+            )
+            is_metric = normalize_metric_setting(
+                self._params.get("IsMetric", return_default=True),
+                default=True,
+            )
+            return language, is_metric
+        except Exception:
+            return CLUSTER_LANGUAGE_KO, True
+
+
 class ClusterLiveFpsParamReader:
     def __init__(self) -> None:
         self._params = None
@@ -348,6 +381,25 @@ class ClusterCameraViewModeParamReader:
             return normalize_cluster_camera_view_mode(self._params.get_int(CLUSTER_CAMERA_VIEW_MODE_PARAM))
         except Exception:
             return 0
+
+
+class ClusterPanelLayoutParamReader:
+    def __init__(self) -> None:
+        self._params = None
+        try:
+            from openpilot.common.params import Params
+
+            self._params = Params()
+        except Exception:
+            pass
+
+    def read(self) -> int:
+        if self._params is None:
+            return CLUSTER_PANEL_LAYOUT_DRIVING_LEFT
+        try:
+            return normalize_cluster_panel_layout(self._params.get_int(CLUSTER_PANEL_LAYOUT_PARAM))
+        except Exception:
+            return CLUSTER_PANEL_LAYOUT_DRIVING_LEFT
 
 
 class ClusterRadarInfoParamReader:
@@ -635,6 +687,7 @@ def run_demo(
     route_overlay_mode: str,
     route_tools_mode: str,
     camera_view_mode: int | None,
+    panel_layout: str | int | None,
     route_loop: bool,
     route_pause_on_cutin: bool,
     route_replay_speed: float,
@@ -654,6 +707,8 @@ def run_demo(
     hud_encoder_watch: int | None,
     hud_core_mode_watch: int | None,
     hud_priority_watch: int | None,
+    language: str | None,
+    is_metric: bool | None,
 ) -> None:
     if hud_core_mode_watch is not None:
         hud_core_mode_watch = normalize_cluster_core_mode(hud_core_mode_watch)
@@ -751,6 +806,22 @@ def run_demo(
     theme_override = normalize_cluster_theme_mode(theme_mode) if theme_mode is not None else None
     theme_param_reader = ClusterThemeParamReader() if theme_override is None else None
     active_theme_mode = theme_override or (theme_param_reader.read() if theme_param_reader is not None else "auto")
+    display_pref_param_reader = (
+        ClusterDisplayPreferencesParamReader()
+        if language is None or is_metric is None
+        else None
+    )
+    param_language, param_is_metric = (
+        display_pref_param_reader.read()
+        if display_pref_param_reader is not None
+        else (CLUSTER_LANGUAGE_KO, True)
+    )
+    active_language = (
+        normalize_cluster_language(language, default=CLUSTER_LANGUAGE_KO)
+        if language is not None
+        else param_language
+    )
+    active_is_metric = bool(is_metric) if is_metric is not None else param_is_metric
     screen_mode_override = normalize_cluster_screen_mode(screen_mode) if screen_mode is not None else None
     screen_mode_param_reader = (
         ClusterScreenModeParamReader()
@@ -776,6 +847,17 @@ def run_demo(
         if camera_view_override is not None
         else camera_view_param_reader.read()
     )
+    panel_layout_override = (
+        normalize_cluster_panel_layout(panel_layout)
+        if panel_layout is not None
+        else None
+    )
+    panel_layout_param_reader = ClusterPanelLayoutParamReader() if panel_layout_override is None else None
+    active_panel_layout = (
+        panel_layout_override
+        if panel_layout_override is not None
+        else panel_layout_param_reader.read()
+    )
     radar_info_param_reader = ClusterRadarInfoParamReader()
     active_radar_info_mode = radar_info_param_reader.read()
     radar_display_param_reader = ClusterRadarDisplayParamReader()
@@ -795,9 +877,17 @@ def run_demo(
         target_fps=max(0, int(round(target_fps))),
         theme_mode=active_theme_mode,
         screen_mode=active_screen_mode,
+        panel_layout=active_panel_layout,
+        language=active_language,
+        is_metric=active_is_metric,
+    )
+    print(
+        f"Display preferences initial: language={active_language} units={'metric' if active_is_metric else 'imperial'}",
+        flush=True,
     )
     print(f"{CLUSTER_SCREEN_MODE_PARAM} initial: {active_screen_mode}", flush=True)
     print(f"{CLUSTER_CAMERA_VIEW_MODE_PARAM} initial: {active_camera_view_mode}", flush=True)
+    print(f"{CLUSTER_PANEL_LAYOUT_PARAM} initial: {active_panel_layout}", flush=True)
     print(
         f"{CLUSTER_RADAR_INFO_PARAM} initial: {active_radar_info_mode} "
         f"{CLUSTER_RADAR_DISPLAY_PARAM} initial: {active_radar_display_mode} "
@@ -884,10 +974,12 @@ def run_demo(
     last_frame_time = start_time
     last_report_time = start_time
     next_theme_param_read = start_time
+    next_display_pref_param_read = start_time
     next_fps_param_read = start_time + FPS_PARAM_POLL_SECONDS
     next_brightness_param_read = start_time
     next_screen_mode_param_read = start_time
     next_camera_view_param_read = start_time
+    next_panel_layout_param_read = start_time
     next_radar_param_read = start_time
     next_hud_mode_param_read = start_time
     next_hud_mirror_param_read = start_time + HUD_MIRROR_PARAM_POLL_SECONDS
@@ -1083,6 +1175,23 @@ def run_demo(
                 if next_theme_mode != renderer.theme_mode:
                     renderer.set_theme_mode(next_theme_mode)
                 next_theme_param_read = now + THEME_PARAM_POLL_SECONDS
+            if display_pref_param_reader is not None and now >= next_display_pref_param_read:
+                param_language, param_is_metric = display_pref_param_reader.read()
+                next_language = (
+                    normalize_cluster_language(language, default=CLUSTER_LANGUAGE_KO)
+                    if language is not None
+                    else param_language
+                )
+                next_is_metric = bool(is_metric) if is_metric is not None else param_is_metric
+                if next_language != renderer.language or next_is_metric != renderer.is_metric:
+                    old_units = "metric" if renderer.is_metric else "imperial"
+                    next_units = "metric" if next_is_metric else "imperial"
+                    print(
+                        f"Display preferences updated: {renderer.language}/{old_units} -> {next_language}/{next_units}",
+                        flush=True,
+                    )
+                    renderer.set_display_preferences(next_language, next_is_metric)
+                next_display_pref_param_read = now + DISPLAY_PREF_PARAM_POLL_SECONDS
             if screen_mode_param_reader is not None and now >= next_screen_mode_param_read:
                 next_screen_mode = screen_mode_param_reader.read()
                 if next_screen_mode != renderer.screen_mode:
@@ -1109,6 +1218,16 @@ def run_demo(
                         )
                         active_camera_view_mode = next_camera_view_mode
                 next_camera_view_param_read = now + CAMERA_VIEW_PARAM_POLL_SECONDS
+            if panel_layout_param_reader is not None and now >= next_panel_layout_param_read:
+                next_panel_layout = panel_layout_param_reader.read()
+                if next_panel_layout != renderer.panel_layout:
+                    print(
+                        f"{CLUSTER_PANEL_LAYOUT_PARAM} updated: "
+                        f"{renderer.panel_layout} -> {next_panel_layout}",
+                        flush=True,
+                    )
+                    renderer.set_panel_layout(next_panel_layout)
+                next_panel_layout_param_read = now + PANEL_LAYOUT_PARAM_POLL_SECONDS
             if now >= next_radar_param_read:
                 next_radar_info_mode = radar_info_param_reader.read()
                 if next_radar_info_mode != active_radar_info_mode:
@@ -2163,11 +2282,39 @@ def parse_args() -> argparse.Namespace:
         help=f"Camera view override. Default reads {CLUSTER_CAMERA_VIEW_MODE_PARAM}; mode 2 is camera.",
     )
     parser.add_argument(
+        "--panel-layout",
+        default=None,
+        help=(
+            "Panel layout override: driving-left (default) or driving-right. "
+            f"Default reads {CLUSTER_PANEL_LAYOUT_PARAM}."
+        ),
+    )
+    parser.add_argument(
         "--theme",
         choices=("auto", "dark", "light"),
         default=None,
         help=f"HUD theme override. Default reads {CLUSTER_THEME_PARAM}: 0 auto, 1 dark, 2 light.",
     )
+    parser.add_argument(
+        "--language",
+        choices=("ko", "en"),
+        default=None,
+        help="Cluster text language override. Default follows LanguageSetting.",
+    )
+    unit_group = parser.add_mutually_exclusive_group()
+    unit_group.add_argument(
+        "--metric",
+        dest="is_metric",
+        action="store_true",
+        help="Show speeds and distances in km/h, m, and km.",
+    )
+    unit_group.add_argument(
+        "--imperial",
+        dest="is_metric",
+        action="store_false",
+        help="Show speeds and distances in mph, ft, and mi.",
+    )
+    parser.set_defaults(is_metric=None)
     parser.add_argument(
         "--screen-mode",
         default=None,
@@ -2494,6 +2641,7 @@ def main(*, exit_on_error: bool = True) -> None:
             args.route_overlay,
             args.route_tools,
             args.camera_view_mode,
+            args.panel_layout,
             args.route_loop,
             args.route_pause_on_cutin,
             args.route_replay_speed,
@@ -2513,6 +2661,8 @@ def main(*, exit_on_error: bool = True) -> None:
             args.cluster_hud_encoder,
             args.cluster_hud_core_mode,
             args.cluster_hud_priority,
+            args.language,
+            args.is_metric,
         )
     except KeyboardInterrupt:
         print("\nStopped.")

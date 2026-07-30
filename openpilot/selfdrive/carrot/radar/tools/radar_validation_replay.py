@@ -38,18 +38,20 @@ from openpilot.selfdrive.carrot.radar_motion import (
   RadarMotionPredictor,
   VisionRadarMatcher,
   apply_vision_bracket_cutin_support,
-  can_start_current_path_lead_two,
   cutin_can_compete_with_primary,
   front_cutin_motion_supported,
+  lead_from_vision,
   lead_duplicates_primary,
   lead_from_radar_point,
   lead_from_vision_match,
+  match_dpath_primary_lead,
   prefer_front_radar_kinematics,
+  radar_motion_sensitivity,
   model_path_point_at_s,
   project_to_model_path,
-  select_primary_radar_points,
   visible_motion_points,
   vision_lead_from_model,
+  vision_only_lead_allowed,
 )
 
 
@@ -72,22 +74,29 @@ VALIDATION_CORNER_MAX_MEASUREMENT_AGE_S = 0.10
 KOREAN_FONT_BASE_SIZE = 40
 VALIDATION_PROBABILITY_MIN = 0.20
 VALIDATION_PROBABILITY_MAX = 0.80
-VALIDATION_LOOKAHEAD_MIN_S = 3.50
-VALIDATION_LOOKAHEAD_MAX_S = 5.00
 VALIDATION_DEFAULT_LOOKAHEAD_S = 5.00
 VALIDATION_MIN_CONTINUOUS_OVERLAP_S = 0.50
 STATIONARY_HANDOFF_MAX_DREL_DELTA_M = 3.5
 STATIONARY_HANDOFF_MAX_YREL_DELTA_M = 1.5
 VALIDATION_SETTINGS_ENV = "CARROT_RADAR_VALIDATION_SETTINGS"
 VALIDATION_MOTION_MODES = ("normal", "front")
+VALIDATION_DEFAULT_SENSITIVITY = 3
+LEAD_ONE_RADAR_RGB = (246, 142, 55)
+LEAD_ONE_VISION_RGB = (72, 145, 255)
+LEAD_TWO_RGB = (245, 211, 72)
+VALIDATION_SENSITIVITY_LABELS = (
+  "사용 안 함",
+  "둔감",
+  "약간 둔감",
+  "보통",
+  "민감",
+  "아주 민감",
+)
 
 
 def _validation_lookahead_s(value: float) -> float:
-  clamped = min(max(
-    float(value),
-    VALIDATION_LOOKAHEAD_MIN_S,
-  ), VALIDATION_LOOKAHEAD_MAX_S)
-  return round(clamped * 2.0) / 2.0
+  del value
+  return VALIDATION_DEFAULT_LOOKAHEAD_S
 
 
 @dataclass(frozen=True)
@@ -210,6 +219,14 @@ class Selection:
   lead_two_tentative: bool | None = None
 
 
+def lead_one_rgb(track_id: int | None) -> tuple[int, int, int]:
+  return (
+    LEAD_ONE_VISION_RGB
+    if track_id is not None and track_id < 0
+    else LEAD_ONE_RADAR_RGB
+  )
+
+
 @dataclass(frozen=True)
 class ValidationReview:
   case_id: str
@@ -327,23 +344,9 @@ def load_validation_lookahead(
   *,
   sensor: str = "corner",
 ) -> float:
+  del path, default
   _default_validation_probability(sensor)
-  fallback = _validation_lookahead_s(default)
-  try:
-    value = float(
-      _read_validation_settings(
-        path or validation_settings_path(),
-      )[f"{sensor}_lookahead_s"],
-    )
-  except (KeyError, TypeError, ValueError):
-    return fallback
-  return (
-    _validation_lookahead_s(value)
-    if VALIDATION_LOOKAHEAD_MIN_S
-    <= value
-    <= VALIDATION_LOOKAHEAD_MAX_S
-    else fallback
-  )
+  return VALIDATION_DEFAULT_LOOKAHEAD_S
 
 
 def save_validation_lookahead(
@@ -353,10 +356,39 @@ def save_validation_lookahead(
   sensor: str = "corner",
 ) -> None:
   _default_validation_probability(sensor)
-  value = _validation_lookahead_s(lookahead_s)
+  _validation_lookahead_s(lookahead_s)
   settings_path = path or validation_settings_path()
   payload = _read_validation_settings(settings_path)
-  payload[f"{sensor}_lookahead_s"] = round(value, 1)
+  payload.pop(f"{sensor}_lookahead_s", None)
+  _write_validation_settings(settings_path, payload)
+
+
+def load_validation_sensitivity(
+  path: Path | None = None,
+  default: int = VALIDATION_DEFAULT_SENSITIVITY,
+) -> int:
+  fallback = max(0, min(5, int(default)))
+  try:
+    value = int(
+      _read_validation_settings(
+        path or validation_settings_path(),
+      )["cut_in_sensitivity"],
+    )
+  except (KeyError, TypeError, ValueError):
+    return fallback
+  return value if 0 <= value <= 5 else fallback
+
+
+def save_validation_sensitivity(
+  sensitivity: int,
+  path: Path | None = None,
+) -> None:
+  value = max(0, min(5, int(sensitivity)))
+  settings_path = path or validation_settings_path()
+  payload = _read_validation_settings(settings_path)
+  payload["cut_in_sensitivity"] = value
+  payload.pop("corner_lookahead_s", None)
+  payload.pop("front_lookahead_s", None)
   _write_validation_settings(settings_path, payload)
 
 
@@ -441,8 +473,16 @@ def lead_continuity_segments(
       and abs(candidate.y_rel - previous_candidate.y_rel)
       <= STATIONARY_HANDOFF_MAX_YREL_DELTA_M
     )
+    vision_radar_display_changed = (
+      previous_candidate is not None
+      and (previous_candidate.track_id < 0) != (candidate.track_id < 0)
+    )
     if current and (
-      current[-1][2] != point[2] and not stationary_handoff
+      current[-1][2] != point[2]
+      and (
+        vision_radar_display_changed
+        or not stationary_handoff
+      )
       or point[0] - current[-1][0] > 0.15
     ):
       segments.append(tuple(current))
@@ -555,6 +595,8 @@ def radar_trajectory_series(
   frames: Iterable[RadarFrame],
   motion_sensor: str | None = None,
   lead_one_outputs: Sequence[dict[str, Any] | None] | None = None,
+  *,
+  directional_min_consistency: float | None = None,
 ) -> tuple[dict[tuple[str, int], RadarMotionPrediction], ...]:
   frame_values = tuple(frames)
   selected_sensor = motion_sensor or preferred_radar_motion_sensor(frame_values)
@@ -565,7 +607,13 @@ def radar_trajectory_series(
   )
   if len(lead_values) != len(frame_values):
     raise ValueError("leadOne outputs must align with radar frames")
-  predictor = RadarMotionPredictor()
+  predictor = (
+    RadarMotionPredictor()
+    if directional_min_consistency is None
+    else RadarMotionPredictor(
+      directional_min_consistency=directional_min_consistency,
+    )
+  )
   return tuple(
     predictor.update(
       frame.time_s,
@@ -700,6 +748,7 @@ def _controller_model(frame: RadarFrame) -> Any:
       )
       for lead in frame.model_leads
     ),
+    velocity=SimpleNamespace(x=(frame.v_ego,)),
   )
 
 
@@ -742,6 +791,19 @@ def front_radar_display_points(frame: RadarFrame) -> tuple[RadarPoint, ...]:
       point.measured
       and point.source == "frontRadar"
       and DISPLAY_MIN_DREL_M <= point.d_rel <= DEFAULT_FORWARD_RANGE_M
+    )
+  )
+
+
+def corner_radar_display_points(frame: RadarFrame) -> tuple[RadarPoint, ...]:
+  return tuple(
+    point for point in radar_points_at_model_time(frame)
+    if (
+      point.measured
+      and point.source.startswith("corner")
+      and DISPLAY_MIN_DREL_M
+      <= point.d_rel
+      <= DEFAULT_FORWARD_RANGE_M
     )
   )
 
@@ -859,8 +921,9 @@ class RadarMotionShadowSelector:
   def __init__(
     self,
     frames: Sequence[RadarFrame],
-    decision_threshold: float = SHADOW_CUTIN_THRESHOLD,
+    decision_threshold: float | None = None,
     *,
+    cut_in_sensitivity: int = VALIDATION_DEFAULT_SENSITIVITY,
     motion_sensor: str | None = None,
     motion_points: Sequence[tuple[RadarPoint, ...]] | None = None,
     trajectories: Sequence[
@@ -872,7 +935,16 @@ class RadarMotionShadowSelector:
     if motion_sensor not in (None, "corner", "front"):
       raise ValueError(f"unsupported radar motion sensor: {motion_sensor}")
     self.motion_sensor = motion_sensor or preferred_radar_motion_sensor(frames)
-    self.decision_threshold = float(decision_threshold)
+    self.cut_in_sensitivity = max(0, min(5, int(cut_in_sensitivity)))
+    self.motion_sensitivity = radar_motion_sensitivity(
+      self.cut_in_sensitivity,
+      self.motion_sensor,
+    )
+    self.decision_threshold = (
+      self.motion_sensitivity.cut_in_threshold
+      if decision_threshold is None
+      else float(decision_threshold)
+    )
     self.maximum_lookahead_s = _validation_lookahead_s(
       maximum_lookahead_s,
     )
@@ -889,19 +961,37 @@ class RadarMotionShadowSelector:
             if not point.source.startswith("corner")
           )
         )
-        match = matcher.match(
+        match = match_dpath_primary_lead(
+          matcher,
           _controller_model(frame),
-          select_primary_radar_points(aligned_points, 1),
+          aligned_points,
           frame.path,
           time_s=frame.time_s,
           stationary_points=stationary_points,
-          prefer_primary_stationary=True,
+          enable_radar_tracks=1,
         )
-        lead_one_results.append(
-          lead_from_vision_match(match)
-          if match is not None
-          else None
-        )
+        if match is not None:
+          lead_one_results.append(lead_from_vision_match(match))
+        else:
+          vision = matcher.vision_fallback
+          lead_one_results.append(
+            lead_from_vision(
+              vision,
+              frame.path,
+              frame.v_ego,
+              model_v_ego=frame.v_ego,
+            )
+            if (
+              vision is not None
+              and vision_only_lead_allowed(
+                1,
+                side_cutin_supported=(
+                  matcher.vision_only_side_cutin_supported
+                ),
+              )
+            )
+            else None
+          )
       lead_one_values = tuple(lead_one_results)
     else:
       lead_one_values = tuple(lead_one_outputs)
@@ -912,6 +1002,9 @@ class RadarMotionShadowSelector:
         frames,
         self.motion_sensor,
         lead_one_values,
+        directional_min_consistency=(
+          self.motion_sensitivity.directional_min_consistency
+        ),
       )
     )
     self.motion_points = (
@@ -960,6 +1053,7 @@ class RadarMotionShadowSelector:
     lead_two_tracker = DPathLeadTwoTracker()
     decision_tracker = RadarMotionDecisionTracker(
       threshold=self.decision_threshold,
+      confirmation_s=self.motion_sensitivity.confirmation_s,
     )
     for frame, predictions, lead_one in zip(
       frames,
@@ -1031,7 +1125,11 @@ class RadarMotionShadowSelector:
       ))
       decision = decision_tracker.update(
         frame.time_s,
-        predictions.values(),
+        (
+          predictions.values()
+          if self.motion_sensitivity.cut_in_enabled
+          else ()
+        ),
       )
       confirmed_by_identity = {
         (
@@ -1081,6 +1179,9 @@ class RadarMotionShadowSelector:
           tracked_close_entry=getattr(
             prediction, "front_tracked_close_entry", False,
           ),
+          minimum_directional_consistency=(
+            self.motion_sensitivity.directional_min_consistency
+          ),
         )
         lead_point = prefer_front_radar_kinematics(
           point, all_aligned_points, front_kinematic_matches,
@@ -1117,7 +1218,8 @@ class RadarMotionShadowSelector:
           ),
         )
         confirmed_cutin = (
-          cutin is not None
+          self.motion_sensitivity.cut_in_enabled
+          and cutin is not None
           and front_motion_supported
           and primary_competition_allowed
         )
@@ -1136,19 +1238,6 @@ class RadarMotionShadowSelector:
             or prediction.d_path * prediction.d_path_rate_long <= 0.0
           ),
           confirmed_cutin=confirmed_cutin,
-          current_path_motion=can_start_current_path_lead_two(
-            prediction.source,
-            float(lead["dRel"]),
-            prediction.current_path_occupancy,
-            (
-              prediction.reason != "insufficient measured dPath history"
-            ),
-            getattr(prediction, "front_tracked_close_entry", False),
-          )
-          and (
-            prediction.path_entry_age_s is None
-            or front_motion_supported
-          ),
         ))
       if (
         active_identity is not None
@@ -1181,7 +1270,6 @@ class RadarMotionShadowSelector:
               continuity_id=continuity_id,
               retainable=True,
               confirmed_cutin=False,
-              current_path_motion=False,
             ))
       lead_selection = lead_two_tracker.update(
         frame.time_s,
@@ -1934,10 +2022,11 @@ class SimulatorUI:
     log_path: Path,
     reviews: tuple[ValidationReview, ...] = (),
     validation_cases_path: Path | None = None,
-    display_threshold: float = SHADOW_CUTIN_THRESHOLD,
+    display_threshold: float | None = None,
     display_lookahead_s: float | None = None,
     settings_path: Path | None = None,
     motion_mode: str = "normal",
+    cut_in_sensitivity: int | None = None,
     sensor_probabilities: dict[str, float] | None = None,
     sensor_lookaheads: dict[str, float] | None = None,
   ) -> None:
@@ -1953,6 +2042,13 @@ class SimulatorUI:
     if motion_mode not in VALIDATION_MOTION_MODES:
       raise ValueError(f"unsupported radar motion mode: {motion_mode}")
     self.motion_mode = motion_mode
+    self.cut_in_sensitivity = (
+      selector.cut_in_sensitivity
+      if cut_in_sensitivity is None
+      else max(0, min(5, int(cut_in_sensitivity)))
+    )
+    self.pending_sensitivity = self.cut_in_sensitivity
+    self.sensitivity_dragging = False
     self.sensor_probabilities = (
       {
         "corner": load_validation_probability(
@@ -1968,38 +2064,21 @@ class SimulatorUI:
         "front": float(sensor_probabilities["front"]),
       }
     )
-    self.sensor_probabilities[selector.motion_sensor] = display_threshold
-    self.display_threshold = display_threshold
-    self.pending_probability = display_threshold
+    applied_threshold = (
+      selector.decision_threshold
+      if display_threshold is None
+      else float(display_threshold)
+    )
+    self.sensor_probabilities[selector.motion_sensor] = applied_threshold
+    self.display_threshold = applied_threshold
+    self.pending_probability = applied_threshold
     self.probability_dragging = False
-    self.sensor_lookaheads = (
-      {
-        "corner": load_validation_lookahead(
-          self.settings_path, sensor="corner",
-        ),
-        "front": load_validation_lookahead(
-          self.settings_path, sensor="front",
-        ),
-      }
-      if sensor_lookaheads is None
-      else {
-        "corner": float(sensor_lookaheads["corner"]),
-        "front": float(sensor_lookaheads["front"]),
-      }
-    )
-    initial_lookahead_s = (
-      selector.maximum_lookahead_s
-      if display_lookahead_s is None
-      else float(display_lookahead_s)
-    )
-    self.sensor_lookaheads[selector.motion_sensor] = initial_lookahead_s
-    self.pending_lookahead_s = initial_lookahead_s
-    self.lookahead_dragging = False
+    del display_lookahead_s, sensor_lookaheads
     self.probability_cache = {
       (
         selector.motion_sensor,
+        selector.cut_in_sensitivity,
         round(selector.decision_threshold, 2),
-        round(selector.maximum_lookahead_s, 1),
       ): selector,
     }
     self.sensor_history_cache = {
@@ -2018,7 +2097,7 @@ class SimulatorUI:
       frames,
       selector,
       ("front+corner",),
-      display_threshold,
+      applied_threshold,
     )
     self._refresh_lead_continuity()
     self.handled_events: set[int] = set()
@@ -2076,84 +2155,18 @@ class SimulatorUI:
       VALIDATION_PROBABILITY_MIN,
     ), VALIDATION_PROBABILITY_MAX), 2)
 
-  def _activate_probability(
+  def _activate_sensitivity(
     self,
-    value: float,
+    value: int,
     selector: RadarMotionShadowSelector,
   ) -> None:
     self.selector = selector
-    self.sensor_probabilities[selector.motion_sensor] = value
-    self.display_threshold = value
-    self.pending_probability = value
-    self.events = trajectory_model_review_events(
-      self.frames,
-      selector,
-      ("front+corner",),
-      value,
+    self.cut_in_sensitivity = value
+    self.pending_sensitivity = value
+    self.display_threshold = selector.decision_threshold
+    self.sensor_probabilities[selector.motion_sensor] = (
+      selector.decision_threshold
     )
-    self.handled_events.clear()
-    self._refresh_lead_continuity()
-    lead_two_frames = sum(
-      selection.lead_two is not None
-      for selection in selector.selections
-    )
-    self.status = (
-      f"경로 근접 감도 {value:.2f} 적용 완료: "
-      + f"진입 {len(self.events)}회, L2 {lead_two_frames}프레임"
-    )
-
-  def _request_probability(self, probability: float) -> None:
-    value = self._clamp_probability(probability)
-    sensor = self.selector.motion_sensor
-    self.pending_probability = value
-    save_error: OSError | None = None
-    try:
-      save_validation_probability(
-        value, self.settings_path, sensor=sensor,
-      )
-    except OSError as exc:
-      save_error = exc
-
-    lookahead_s = self.sensor_lookaheads[sensor]
-    cache_key = (sensor, value, round(lookahead_s, 1))
-    cached = self.probability_cache.get(cache_key)
-    if cached is None:
-      motion_points, trajectories, lead_one_outputs = (
-        self.sensor_history_cache[sensor]
-      )
-      cached = RadarMotionShadowSelector(
-        self.frames,
-        value,
-        motion_sensor=sensor,
-        motion_points=motion_points,
-        trajectories=trajectories,
-        lead_one_outputs=lead_one_outputs,
-        maximum_lookahead_s=lookahead_s,
-      )
-      self.probability_cache[cache_key] = cached
-      while len(self.probability_cache) > 8:
-        self.probability_cache.pop(next(iter(self.probability_cache)))
-
-    if abs(self.selector.decision_threshold - value) >= 0.005:
-      self._activate_probability(value, cached)
-    else:
-      self.display_threshold = value
-      self.status = f"경로 근접 감도 {value:.2f} 이미 적용됨"
-    if save_error is not None:
-      self.status += f" · 저장 실패: {save_error}"
-
-  @staticmethod
-  def _clamp_lookahead(lookahead_s: float) -> float:
-    return _validation_lookahead_s(lookahead_s)
-
-  def _activate_lookahead(
-    self,
-    value: float,
-    selector: RadarMotionShadowSelector,
-  ) -> None:
-    self.selector = selector
-    self.sensor_lookaheads[selector.motion_sensor] = value
-    self.pending_lookahead_s = value
     self.events = trajectory_model_review_events(
       self.frames,
       selector,
@@ -2166,48 +2179,70 @@ class SimulatorUI:
       selection.lead_two is not None
       for selection in selector.selections
     )
+    label = VALIDATION_SENSITIVITY_LABELS[value]
+    confirmation_s = selector.motion_sensitivity.confirmation_s
+    policy_text = (
+      "CUT-IN 사용 안 함"
+      if value == 0
+      else f"확인 {confirmation_s:.2f}초"
+    )
     self.status = (
-      f"미래 {value:.1f}초 · 연속 침범 "
-      + f"{VALIDATION_MIN_CONTINUOUS_OVERLAP_S:.1f}초 적용 완료: "
-      + f"진입 {len(self.events)}회, L2 {lead_two_frames}프레임"
+      f"CUT-IN 감도 {value} {label} · {policy_text} "
+      + f"적용 완료: 진입 {len(self.events)}회, "
+      + f"L2 {lead_two_frames}프레임"
     )
 
-  def _request_lookahead(self, lookahead_s: float) -> None:
-    value = self._clamp_lookahead(lookahead_s)
+  def _request_sensitivity(self, sensitivity: int) -> None:
+    value = max(0, min(5, int(sensitivity)))
     sensor = self.selector.motion_sensor
-    self.pending_lookahead_s = value
+    self.pending_sensitivity = value
     save_error: OSError | None = None
     try:
-      save_validation_lookahead(
-        value, self.settings_path, sensor=sensor,
-      )
+      save_validation_sensitivity(value, self.settings_path)
     except OSError as exc:
       save_error = exc
 
-    threshold = self.sensor_probabilities[sensor]
-    cache_key = (sensor, round(threshold, 2), value)
+    policy = radar_motion_sensitivity(value, sensor)
+    cache_key = (sensor, value, round(policy.cut_in_threshold, 2))
     cached = self.probability_cache.get(cache_key)
     if cached is None:
-      motion_points, trajectories, lead_one_outputs = (
-        self.sensor_history_cache[sensor]
-      )
+      cached_history = self.sensor_history_cache.get(sensor)
       cached = RadarMotionShadowSelector(
         self.frames,
-        threshold,
+        cut_in_sensitivity=value,
         motion_sensor=sensor,
-        motion_points=motion_points,
-        trajectories=trajectories,
-        lead_one_outputs=lead_one_outputs,
-        maximum_lookahead_s=value,
+        motion_points=(
+          cached_history[0]
+          if cached_history is not None
+          else None
+        ),
+        lead_one_outputs=(
+          cached_history[2]
+          if cached_history is not None
+          else None
+        ),
+        maximum_lookahead_s=VALIDATION_DEFAULT_LOOKAHEAD_S,
       )
       self.probability_cache[cache_key] = cached
-      while len(self.probability_cache) > 8:
+      self.sensor_history_cache[sensor] = (
+        cached.motion_points,
+        cached.trajectories,
+        cached.lead_one_outputs,
+      )
+      while len(self.probability_cache) > 12:
         self.probability_cache.pop(next(iter(self.probability_cache)))
 
-    if abs(self.selector.maximum_lookahead_s - value) >= 0.05:
-      self._activate_lookahead(value, cached)
+    if (
+      self.selector.cut_in_sensitivity != value
+      or abs(
+        self.selector.decision_threshold
+        - policy.cut_in_threshold
+      ) >= 0.005
+    ):
+      self._activate_sensitivity(value, cached)
     else:
-      self.status = f"미래 판정시간 {value:.1f}초 이미 적용됨"
+      label = VALIDATION_SENSITIVITY_LABELS[value]
+      self.status = f"CUT-IN 감도 {value} {label} 이미 적용됨"
     if save_error is not None:
       self.status += f" · 저장 실패: {save_error}"
 
@@ -2219,20 +2254,22 @@ class SimulatorUI:
       if mode == "front"
       else preferred_radar_motion_sensor(self.frames)
     )
-    value = self._clamp_probability(
-      self.sensor_probabilities[target_sensor],
+    policy = radar_motion_sensitivity(
+      self.cut_in_sensitivity,
+      target_sensor,
     )
-    lookahead_s = self._clamp_lookahead(
-      self.sensor_lookaheads[target_sensor],
+    cache_key = (
+      target_sensor,
+      self.cut_in_sensitivity,
+      round(policy.cut_in_threshold, 2),
     )
-    cache_key = (target_sensor, value, lookahead_s)
     cached = self.probability_cache.get(cache_key)
     if cached is None:
       cached = RadarMotionShadowSelector(
         self.frames,
-        value,
+        cut_in_sensitivity=self.cut_in_sensitivity,
         motion_sensor=target_sensor,
-        maximum_lookahead_s=lookahead_s,
+        maximum_lookahead_s=VALIDATION_DEFAULT_LOOKAHEAD_S,
       )
       self.probability_cache[cache_key] = cached
       self.sensor_history_cache[target_sensor] = (
@@ -2246,11 +2283,10 @@ class SimulatorUI:
       save_validation_motion_mode(mode, self.settings_path)
     except OSError as exc:
       save_error = exc
-    self._activate_probability(value, cached)
-    self.pending_lookahead_s = lookahead_s
+    self._activate_sensitivity(self.cut_in_sensitivity, cached)
     mode_text = "일반(코너 우선)" if mode == "normal" else "프런트 전용"
     self.status = (
-      f"{mode_text} 모드 적용 · {target_sensor} 미래 {lookahead_s:.1f}초"
+      f"{mode_text} 모드 적용 · {target_sensor} · 미래 5.0초 고정"
     )
     if save_error is not None:
       self.status += f" · 저장 실패: {save_error}"
@@ -2629,8 +2665,16 @@ class SimulatorUI:
   def _draw_lead_roles(self, rect: Any, selection: Selection) -> None:
     rl = self.rl
     roles = (
-      ("L1", selection.lead_one, (246, 142, 55)),
-      ("L2", selection.lead_two, (245, 211, 72)),
+      (
+        "L1",
+        selection.lead_one,
+        lead_one_rgb(
+          selection.lead_one.track_id
+          if selection.lead_one is not None
+          else None
+        ),
+      ),
+      ("L2", selection.lead_two, LEAD_TWO_RGB),
     )
     for label, candidate, rgb in roles:
       if (
@@ -2689,7 +2733,13 @@ class SimulatorUI:
       (candidate.source, candidate.track_id)
       for candidate in selection.decision_cutin_candidates
     }
-    for point in self.selector.motion_points[self.index]:
+    display_points = {
+      (point.source, point.track_id): point
+      for point in self.selector.motion_points[self.index]
+    }
+    for point in corner_radar_display_points(frame):
+      display_points.setdefault((point.source, point.track_id), point)
+    for point in display_points.values():
       if not DISPLAY_MIN_DREL_M <= point.d_rel <= DEFAULT_FORWARD_RANGE_M:
         continue
       prediction = self.selector.trajectories[self.index].get(
@@ -2702,6 +2752,7 @@ class SimulatorUI:
         prediction is None
         and (point.source, point.track_id) not in selected_keys
         and not position_only
+        and not point.source.startswith("corner")
       ):
         continue
       x, y = self._screen(rect, point.d_rel, point.y_rel)
@@ -2709,11 +2760,7 @@ class SimulatorUI:
       control_eligible_current_path = (
         diagnostic is not None
         and diagnostic.current_path_occupancy
-        and (
-          prediction is not None
-          and prediction.cut_in_detection_allowed
-          or (point.source, point.track_id) in selected_keys
-        )
+        and (point.source, point.track_id) in selected_keys
       )
       if (point.source, point.track_id) in confirmed_cutin_keys:
         color = (246, 142, 55)
@@ -2724,12 +2771,12 @@ class SimulatorUI:
       elif diagnostic is not None and diagnostic.current_path_occupancy:
         color = (115, 125, 135)
         radius = 3.0
-      elif position_only:
-        color = (115, 125, 135)
-        radius = 3.0
       elif point.source.startswith("corner"):
         color = (194, 112, 240)
         radius = 5.0
+      elif position_only:
+        color = (115, 125, 135)
+        radius = 3.0
       else:
         color = (70, 190, 220)
         radius = 5.0
@@ -2759,7 +2806,7 @@ class SimulatorUI:
       )
     self._draw_lead_roles(rect, selection)
     self._draw_text(
-      "-30~120m | 흰 점: 내 차 | 주황 □: leadOne | 노랑 □: leadTwo",
+      "-30~120m | 흰 점: 내 차 | 주황 □: radar L1 | 파랑 □: vision L1 | 노랑 □: L2",
       int(rect.x + 12.0),
       int(rect.y + 8.0),
       14,
@@ -2771,7 +2818,7 @@ class SimulatorUI:
       else "F: front radar 표시"
     )
     self._draw_text(
-      f"회색: 차선 | 흰 점선: 차선 중심 | 파랑: model path | {front_text}",
+      f"회색: 차선 | 흰 점선: 차선 중심 | 파랑: model path | 보라: corner radar | {front_text}",
       int(rect.x + 12.0),
       int(rect.y + 27.0),
       14,
@@ -2796,20 +2843,11 @@ class SimulatorUI:
   def _draw_probability_slider(self, panel_rect: Any) -> None:
     rl = self.rl
     slider = self._probability_slider_rect(panel_rect)
-    ratio = (
-      (self.pending_lookahead_s - VALIDATION_LOOKAHEAD_MIN_S)
-      / (VALIDATION_LOOKAHEAD_MAX_S - VALIDATION_LOOKAHEAD_MIN_S)
-    )
-    ratio = min(max(ratio, 0.0), 1.0)
+    ratio = self.pending_sensitivity / 5.0
     knob_x = slider.x + slider.width * ratio
-    applying = (
-      abs(
-        self.selector.maximum_lookahead_s - self.pending_lookahead_s
-      )
-      >= 0.05
-    )
+    applying = self.selector.cut_in_sensitivity != self.pending_sensitivity
     applied_text = (
-      f"현재 {self.selector.maximum_lookahead_s:.1f}초 · 놓으면 적용"
+      f"현재 {self.selector.cut_in_sensitivity} · 놓으면 적용"
       if applying
       else "적용 완료"
     )
@@ -2818,9 +2856,22 @@ class SimulatorUI:
       if self.selector.motion_sensor == "corner"
       else "프런트"
     )
+    pending_policy = radar_motion_sensitivity(
+      self.pending_sensitivity,
+      self.selector.motion_sensor,
+    )
+    sensitivity_text = VALIDATION_SENSITIVITY_LABELS[
+      self.pending_sensitivity
+    ]
+    confirmation_text = (
+      "CUT-IN 사용 안 함"
+      if self.pending_sensitivity == 0
+      else f"확인 {pending_policy.confirmation_s:.2f}초"
+    )
     self._draw_text(
-      f"{sensor_text} 미래 판정 {self.pending_lookahead_s:.1f}초"
-      + f" · 연속 침범 ≥{VALIDATION_MIN_CONTINUOUS_OVERLAP_S:.1f}초"
+      f"{sensor_text} CUT-IN 감도 {self.pending_sensitivity} "
+      + f"{sensitivity_text} · {confirmation_text}"
+      + " · 미래 5.0초 고정"
       + f"  {applied_text}",
       int(slider.x),
       int(slider.y - 27.0),
@@ -2841,15 +2892,22 @@ class SimulatorUI:
       self._color((245, 247, 250)),
     )
     self._draw_text(
-      f"보수 {VALIDATION_LOOKAHEAD_MIN_S:.1f}초",
+      "0 사용 안 함",
       int(slider.x),
       int(slider.y + 12.0),
       11,
       self._color((145, 158, 170)),
     )
     self._draw_text(
-      f"민감 {VALIDATION_LOOKAHEAD_MAX_S:.1f}초",
-      int(slider.x + slider.width - 70.0),
+      "3 보통",
+      int(slider.x + slider.width * 0.5 - 20.0),
+      int(slider.y + 12.0),
+      11,
+      self._color((145, 158, 170)),
+    )
+    self._draw_text(
+      "5 아주 민감",
+      int(slider.x + slider.width - 72.0),
       int(slider.y + 12.0),
       11,
       self._color((145, 158, 170)),
@@ -2893,12 +2951,17 @@ class SimulatorUI:
       )
 
     series = (
-      (self.lead_one_segments, (246, 142, 55)),
-      (self.lead_two_segments, (245, 211, 72)),
+      (self.lead_one_segments, True),
+      (self.lead_two_segments, False),
     )
-    for segments, rgb in series:
-      color = self._color(rgb)
+    for segments, is_lead_one in series:
       for segment in segments:
+        rgb = (
+          lead_one_rgb(segment[0][2])
+          if is_lead_one
+          else LEAD_TWO_RGB
+        )
+        color = self._color(rgb)
         previous = None
         for time_s, distance, _ in segment:
           current = position(time_s, distance)
@@ -2913,8 +2976,16 @@ class SimulatorUI:
       self.index,
     )
     lead_values = (
-      ("L1", current_selection.lead_one, (246, 142, 55)),
-      ("L2", current_selection.lead_two, (245, 211, 72)),
+      (
+        "L1",
+        current_selection.lead_one,
+        lead_one_rgb(
+          current_selection.lead_one.track_id
+          if current_selection.lead_one is not None
+          else None
+        ),
+      ),
+      ("L2", current_selection.lead_two, LEAD_TWO_RGB),
     )
     legend_x = int(plot_left)
     for label, candidate, rgb in lead_values:
@@ -3338,34 +3409,30 @@ class SimulatorUI:
       probability_slider.width,
       probability_slider.height + 24.0,
     )
-    slider_interaction = self.lookahead_dragging
+    slider_interaction = self.sensitivity_dragging
     if (
       rl.is_mouse_button_pressed(rl.MOUSE_BUTTON_LEFT)
       and rl.check_collision_point_rec(mouse, slider_hit)
     ):
-      self.lookahead_dragging = True
+      self.sensitivity_dragging = True
       slider_interaction = True
       self.paused = True
     if (
-      self.lookahead_dragging
+      self.sensitivity_dragging
       and rl.is_mouse_button_down(rl.MOUSE_BUTTON_LEFT)
     ):
       ratio = min(max(
         (mouse.x - probability_slider.x) / probability_slider.width,
         0.0,
       ), 1.0)
-      self.pending_lookahead_s = _validation_lookahead_s(
-        VALIDATION_LOOKAHEAD_MIN_S
-        + ratio
-        * (VALIDATION_LOOKAHEAD_MAX_S - VALIDATION_LOOKAHEAD_MIN_S),
-      )
+      self.pending_sensitivity = max(0, min(5, round(ratio * 5.0)))
     if (
-      self.lookahead_dragging
+      self.sensitivity_dragging
       and rl.is_mouse_button_released(rl.MOUSE_BUTTON_LEFT)
     ):
-      self.lookahead_dragging = False
+      self.sensitivity_dragging = False
       slider_interaction = True
-      self._request_lookahead(self.pending_lookahead_s)
+      self._request_sensitivity(self.pending_sensitivity)
     timeline_clicked = (
       not slider_interaction
       and rl.is_mouse_button_pressed(rl.MOUSE_BUTTON_LEFT)
@@ -3521,13 +3588,12 @@ def parse_args() -> argparse.Namespace:
     ),
   )
   parser.add_argument(
-    "--lookahead-s",
-    type=float,
+    "--sensitivity",
+    type=int,
     default=None,
     help=(
-      "one-run future lookahead override from 3.5 to 5.0 seconds in "
-      + "0.5-second steps; "
-      + "otherwise load the UI slider's saved sensor-specific value"
+      "Carrot Radar CUT-IN sensitivity 0..5; otherwise use the validation "
+      + "UI's saved level (default 3)"
     ),
   )
   parser.add_argument("--validation-case", action="append", default=[])
@@ -3564,19 +3630,8 @@ def main() -> int:
     raise SystemExit(f"log file does not exist: {args.rlog}")
   if args.prob is not None and not 0.0 <= args.prob <= 1.0:
     raise SystemExit("--prob must be between 0.00 and 1.00")
-  if (
-    args.lookahead_s is not None
-    and (
-      not VALIDATION_LOOKAHEAD_MIN_S
-      <= args.lookahead_s
-      <= VALIDATION_LOOKAHEAD_MAX_S
-      or abs(args.lookahead_s * 2.0 - round(args.lookahead_s * 2.0))
-      > 1e-6
-    )
-  ):
-    raise SystemExit(
-      "--lookahead-s must be 3.5, 4.0, 4.5, or 5.0",
-    )
+  if args.sensitivity is not None and not 0 <= args.sensitivity <= 5:
+    raise SystemExit("--sensitivity must be between 0 and 5")
   if args.front_only and args.motion_mode not in (None, "front"):
     raise SystemExit("--front-only conflicts with --motion-mode normal")
   print(f"Loading {args.rlog} ...", flush=True)
@@ -3591,26 +3646,20 @@ def main() -> int:
     if motion_mode == "front"
     else preferred_radar_motion_sensor(frames)
   )
-  sensor_probabilities = {
-    "corner": VALIDATION_DEFAULT_CORNER_PROBABILITY,
-    "front": VALIDATION_DEFAULT_FRONT_PROBABILITY,
-  }
+  cut_in_sensitivity = (
+    load_validation_sensitivity()
+    if args.sensitivity is None
+    else int(args.sensitivity)
+  )
+  motion_policy = radar_motion_sensitivity(
+    cut_in_sensitivity,
+    motion_sensor,
+  )
   probability = (
-    sensor_probabilities[motion_sensor]
+    motion_policy.cut_in_threshold
     if args.prob is None
     else float(args.prob)
   )
-  sensor_probabilities[motion_sensor] = probability
-  sensor_lookaheads = {
-    "corner": load_validation_lookahead(sensor="corner"),
-    "front": load_validation_lookahead(sensor="front"),
-  }
-  lookahead_s = (
-    sensor_lookaheads[motion_sensor]
-    if args.lookahead_s is None
-    else float(args.lookahead_s)
-  )
-  sensor_lookaheads[motion_sensor] = lookahead_s
   if motion_mode == "front":
     ignored = sum(
       point.measured and point.source.startswith("corner")
@@ -3623,16 +3672,24 @@ def main() -> int:
     )
   print("Building physical dPath predictor history ...", flush=True)
   print(
-    f"Validation {motion_sensor} CUT-IN: probability {probability:.2f}, "
-    + f"future lookahead {lookahead_s:.1f}s, continuous overlap "
+    f"Validation {motion_sensor} CUT-IN: sensitivity "
+    + f"{cut_in_sensitivity} "
+    + f"({VALIDATION_SENSITIVITY_LABELS[cut_in_sensitivity]}), "
+    + f"probability {probability:.2f}, confirmation "
+    + f"{motion_policy.confirmation_s:.2f}s, future lookahead 5.0s, "
+    + "continuous overlap "
     + f">={VALIDATION_MIN_CONTINUOUS_OVERLAP_S:.1f}s",
     flush=True,
   )
   selector = RadarMotionShadowSelector(
     frames,
-    probability,
+    (
+      probability
+      if args.prob is not None
+      else None
+    ),
+    cut_in_sensitivity=cut_in_sensitivity,
     motion_sensor=motion_sensor,
-    maximum_lookahead_s=lookahead_s,
   )
   print_summary(args.rlog, frames, selector)
   if args.summary:
@@ -3647,10 +3704,8 @@ def main() -> int:
     reviews=reviews,
     validation_cases_path=args.validation_cases if reviews else None,
     display_threshold=probability,
-    display_lookahead_s=lookahead_s,
     motion_mode=motion_mode,
-    sensor_probabilities=sensor_probabilities,
-    sensor_lookaheads=sensor_lookaheads,
+    cut_in_sensitivity=cut_in_sensitivity,
   ).run(args.start, args.paused, args.screenshot, args.exit_at_end)
   return 0
 
@@ -3669,6 +3724,8 @@ __all__ = (
   "SHADOW_CUTIN_THRESHOLD",
   "VALIDATION_DEFAULT_CORNER_PROBABILITY",
   "VALIDATION_DEFAULT_FRONT_PROBABILITY",
+  "VALIDATION_DEFAULT_SENSITIVITY",
+  "VALIDATION_SENSITIVITY_LABELS",
   "SimulatorUI",
   "ValidationReview",
   "_copy_points",
@@ -3680,14 +3737,17 @@ __all__ = (
   "candidate_track_ids",
   "comparison_summary",
   "confirmed_cutin_overlap_at",
+  "corner_radar_display_points",
   "current_cutin_track_ids",
   "front_only_frames",
   "front_radar_display_points",
   "is_position_only_reference",
   "lead_continuity_segments",
+  "lead_one_rgb",
   "load_validation_motion_mode",
   "load_validation_lookahead",
   "load_validation_probability",
+  "load_validation_sensitivity",
   "load_frames",
   "main",
   "model_line_y",
@@ -3703,6 +3763,7 @@ __all__ = (
   "save_validation_motion_mode",
   "save_validation_lookahead",
   "save_validation_probability",
+  "save_validation_sensitivity",
   "prediction_with_validation_lookahead",
   "trajectory_history_display_y",
   "trajectory_history_display_position",
