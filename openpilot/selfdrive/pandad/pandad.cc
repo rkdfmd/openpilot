@@ -4,9 +4,11 @@
 #include <array>
 #include <bitset>
 #include <cassert>
+#include <cinttypes>
 #include <cerrno>
 #include <memory>
 #include <thread>
+#include <unordered_map>
 #include <utility>
 
 #include "cereal/gen/cpp/car.capnp.h"
@@ -61,12 +63,29 @@ Panda *connect(std::string serial, uint32_t index) {
 
 void can_send_thread(std::vector<Panda *> pandas, bool fake_send) {
   util::set_thread_name("pandad_can_send");
+  if (!Hardware::PC()) {
+    int err = util::set_realtime_priority(55);
+    if (err != 0) {
+      LOGE("failed to raise Panda CAN send thread priority: %d", err);
+    }
+  }
 
   AlignedBuffer aligned_buf;
   std::unique_ptr<Context> context(Context::create());
   std::unique_ptr<SubSocket> subscriber(SubSocket::create(context.get(), "sendcan", "127.0.0.1", false, true, services.at("sendcan").queue_size));
   assert(subscriber != NULL);
   subscriber->setTimeout(100);
+
+  uint32_t diag_count = 0;
+  uint32_t diag_gap_slow = 0;
+  uint32_t diag_queue_slow = 0;
+  uint32_t diag_write_slow = 0;
+  uint32_t diag_total_slow = 0;
+  uint64_t diag_prev_recv_ns = 0;
+  uint64_t diag_gap_max_us = 0;
+  uint64_t diag_queue_max_us = 0;
+  uint64_t diag_write_max_us = 0;
+  uint64_t diag_total_max_us = 0;
 
   // run as fast as messages come in
   while (!do_exit && check_all_connected(pandas)) {
@@ -77,13 +96,51 @@ void can_send_thread(std::vector<Panda *> pandas, bool fake_send) {
 
     capnp::FlatArrayMessageReader cmsg(aligned_buf.align(msg.get()));
     cereal::Event::Reader event = cmsg.getRoot<cereal::Event>();
+    const uint64_t recv_ns = nanos_since_boot();
+    const uint64_t event_ns = event.getLogMonoTime();
+    const uint64_t queue_age_ns = recv_ns >= event_ns ? recv_ns - event_ns : 0U;
+    if (diag_prev_recv_ns != 0U) {
+      const uint64_t recv_gap_us = (recv_ns - diag_prev_recv_ns) / 1000U;
+      diag_gap_max_us = std::max(diag_gap_max_us, recv_gap_us);
+      diag_gap_slow += recv_gap_us > 12000U;
+    }
+    diag_prev_recv_ns = recv_ns;
 
     // Don't send if older than 1 second
-    if ((nanos_since_boot() - event.getLogMonoTime() < 1e9) && !fake_send) {
+    if ((queue_age_ns < 1e9) && !fake_send) {
+      uint64_t write_max_us = 0;
       for (Panda *panda : pandas) {
         LOGT("sending sendcan to panda: %s", (panda->hw_serial()).c_str());
+        const uint64_t write_start_ns = nanos_since_boot();
         panda->can_send(event.getSendcan());
+        write_max_us = std::max(write_max_us, (nanos_since_boot() - write_start_ns) / 1000U);
         LOGT("sendcan sent to panda: %s", (panda->hw_serial()).c_str());
+      }
+
+      const uint64_t queue_age_us = queue_age_ns / 1000U;
+      const uint64_t total_us = (nanos_since_boot() - event_ns) / 1000U;
+      diag_queue_max_us = std::max(diag_queue_max_us, queue_age_us);
+      diag_write_max_us = std::max(diag_write_max_us, write_max_us);
+      diag_total_max_us = std::max(diag_total_max_us, total_us);
+      diag_queue_slow += queue_age_us > 3000U;
+      diag_write_slow += write_max_us > 3000U;
+      diag_total_slow += total_us > 8000U;
+      diag_count++;
+
+      if (diag_count >= 100U) {
+        LOGW("sendcan_diag: gap_max_us=%" PRIu64 ", queue_max_us=%" PRIu64 ", write_max_us=%" PRIu64
+             ", total_max_us=%" PRIu64 ", gap_over_12ms=%u, queue_over_3ms=%u, write_over_3ms=%u, total_over_8ms=%u",
+             diag_gap_max_us, diag_queue_max_us, diag_write_max_us, diag_total_max_us,
+             diag_gap_slow, diag_queue_slow, diag_write_slow, diag_total_slow);
+        diag_count = 0U;
+        diag_gap_slow = 0U;
+        diag_queue_slow = 0U;
+        diag_write_slow = 0U;
+        diag_total_slow = 0U;
+        diag_gap_max_us = 0U;
+        diag_queue_max_us = 0U;
+        diag_write_max_us = 0U;
+        diag_total_max_us = 0U;
       }
     } else {
       LOGE("sendcan too old to send: %" PRIu64 ", %" PRIu64, nanos_since_boot(), event.getLogMonoTime());
@@ -110,6 +167,58 @@ void can_recv(const std::vector<Panda *> &pandas, PubMaster *pm) {
       canData[i].setSrc(raw_can_data[i].src);
     }
     pm->send("can", msg);
+  }
+}
+
+void can_recv_thread(std::vector<Panda *> pandas) {
+  util::set_thread_name("pandad_can_recv");
+  if (!Hardware::PC()) {
+    int err = util::set_realtime_priority(56);
+    if (err != 0) {
+      LOGE("failed to raise Panda CAN receive thread priority: %d", err);
+    }
+  }
+
+  RateKeeper rk("pandad_can_recv", 100);
+  PubMaster pm({"can"});
+  uint32_t diag_count = 0U;
+  uint32_t diag_gap_slow = 0U;
+  uint32_t diag_read_slow = 0U;
+  uint64_t diag_prev_start_ns = 0U;
+  uint64_t diag_gap_max_us = 0U;
+  uint64_t diag_read_sum_us = 0U;
+  uint64_t diag_read_max_us = 0U;
+
+  while (!do_exit && check_all_connected(pandas)) {
+    const uint64_t start_ns = nanos_since_boot();
+    if (diag_prev_start_ns != 0U) {
+      const uint64_t gap_us = (start_ns - diag_prev_start_ns) / 1000U;
+      diag_gap_max_us = std::max(diag_gap_max_us, gap_us);
+      diag_gap_slow += gap_us > 12000U;
+    }
+    diag_prev_start_ns = start_ns;
+
+    can_recv(pandas, &pm);
+    const uint64_t read_us = (nanos_since_boot() - start_ns) / 1000U;
+    diag_read_sum_us += read_us;
+    diag_read_max_us = std::max(diag_read_max_us, read_us);
+    diag_read_slow += read_us > 10000U;
+    diag_count++;
+
+    if (diag_count >= 100U) {
+      LOGW("can_recv_loop_diag: gap_max_us=%" PRIu64 ", read_avg_us=%" PRIu64
+           ", read_max_us=%" PRIu64 ", gap_over_12ms=%u, read_over_10ms=%u",
+           diag_gap_max_us, diag_read_sum_us / diag_count, diag_read_max_us,
+           diag_gap_slow, diag_read_slow);
+      diag_count = 0U;
+      diag_gap_slow = 0U;
+      diag_read_slow = 0U;
+      diag_gap_max_us = 0U;
+      diag_read_sum_us = 0U;
+      diag_read_max_us = 0U;
+    }
+
+    rk.keepTime();
   }
 }
 
@@ -170,6 +279,7 @@ void fill_panda_can_state(cereal::PandaState::PandaCanState::Builder &cs, const 
 }
 
 std::optional<bool> send_panda_states(PubMaster *pm, const std::vector<Panda *> &pandas, bool is_onroad, bool spoofing_started) {
+  static std::unordered_map<std::string, uint16_t> spi_checksum_counts;
   bool ignition_local = false;
   const uint32_t pandas_cnt = pandas.size();
 
@@ -195,6 +305,20 @@ std::optional<bool> send_panda_states(PubMaster *pm, const std::vector<Panda *> 
     }
 
     health_t health = *health_opt;
+
+    const std::string panda_serial = panda->hw_serial();
+    auto [checksum_it, inserted] = spi_checksum_counts.try_emplace(panda_serial, health.spi_checksum_error_count_pkt);
+    if (inserted) {
+      LOGW("panda_spi_checksum_diag: serial=%s, total=%u, delta=0, baseline=1",
+           panda_serial.c_str(), health.spi_checksum_error_count_pkt);
+    } else if (checksum_it->second != health.spi_checksum_error_count_pkt) {
+      const bool reset = health.spi_checksum_error_count_pkt < checksum_it->second;
+      const uint32_t delta = reset ? health.spi_checksum_error_count_pkt :
+                             health.spi_checksum_error_count_pkt - checksum_it->second;
+      LOGW("panda_spi_checksum_diag: serial=%s, total=%u, delta=%u, baseline=0, reset=%d",
+           panda_serial.c_str(), health.spi_checksum_error_count_pkt, delta, reset);
+      checksum_it->second = health.spi_checksum_error_count_pkt;
+    }
 
     std::array<can_health_t, PANDA_CAN_CNT> can_health{};
     for (uint32_t i = 0; i < PANDA_CAN_CNT; i++) {
@@ -415,50 +539,141 @@ void pandad_run(std::vector<Panda *> &pandas) {
 
   // Start the CAN send thread
   std::thread send_thread(can_send_thread, pandas, fake_send);
+  // Keep CAN receive cadence independent from slower status and serial work.
+  std::thread recv_thread(can_recv_thread, pandas);
 
   Params params;
   RateKeeper rk("pandad", 100);
   SubMaster sm({"selfdriveState"});
-  PubMaster pm({"can", "pandaStates", "peripheralState"});
+  PubMaster pm({"pandaStates", "peripheralState"});
   PandaSafety panda_safety(pandas);
   Panda *peripheral_panda = pandas[0];
   bool engaged = false;
   bool is_onroad = false;
 
-  // Main loop: receive CAN data and process states
+  uint32_t loop_diag_count = 0U;
+  uint32_t loop_diag_peripheral_count = 0U;
+  uint32_t loop_diag_state_count = 0U;
+  uint32_t loop_diag_publish_count = 0U;
+  uint32_t loop_diag_work_slow = 0U;
+  uint64_t loop_diag_prev_start_ns = 0U;
+  uint64_t loop_diag_gap_max_us = 0U;
+  uint64_t loop_diag_peripheral_sum_us = 0U;
+  uint64_t loop_diag_peripheral_max_us = 0U;
+  uint64_t loop_diag_state_sum_us = 0U;
+  uint64_t loop_diag_state_max_us = 0U;
+  uint64_t loop_diag_publish_sum_us = 0U;
+  uint64_t loop_diag_publish_max_us = 0U;
+  uint64_t loop_diag_serial_sum_us = 0U;
+  uint64_t loop_diag_serial_max_us = 0U;
+  uint64_t loop_diag_work_sum_us = 0U;
+  uint64_t loop_diag_work_max_us = 0U;
+
+  // Main loop: process lower-rate state, peripheral, and diagnostic work.
   while (!do_exit && check_all_connected(pandas)) {
-    can_recv(pandas, &pm);
+    const uint64_t loop_start_ns = nanos_since_boot();
+    if (loop_diag_prev_start_ns != 0U) {
+      loop_diag_gap_max_us = std::max(loop_diag_gap_max_us, (loop_start_ns - loop_diag_prev_start_ns) / 1000U);
+    }
+    loop_diag_prev_start_ns = loop_start_ns;
 
     // Process peripheral state at 20 Hz
     if (rk.frame() % 5 == 0) {
+      const uint64_t peripheral_start_ns = nanos_since_boot();
       process_peripheral_state(peripheral_panda, &pm, no_fan_control);
+      const uint64_t peripheral_us = (nanos_since_boot() - peripheral_start_ns) / 1000U;
+      loop_diag_peripheral_sum_us += peripheral_us;
+      loop_diag_peripheral_max_us = std::max(loop_diag_peripheral_max_us, peripheral_us);
+      loop_diag_peripheral_count++;
     }
 
     // Process panda state at 10 Hz
     if (rk.frame() % 10 == 0) {
+      const uint64_t state_start_ns = nanos_since_boot();
       sm.update(0);
       engaged = sm.allAliveAndValid({"selfdriveState"}) && sm["selfdriveState"].getSelfdriveState().getEnabled();
       is_onroad = params.getBool("IsOnroad");
       process_panda_state(pandas, &pm, engaged, is_onroad, spoofing_started);
       panda_safety.configureSafetyMode(is_onroad);
+      const uint64_t state_us = (nanos_since_boot() - state_start_ns) / 1000U;
+      loop_diag_state_sum_us += state_us;
+      loop_diag_state_max_us = std::max(loop_diag_state_max_us, state_us);
+      loop_diag_state_count++;
     }
 
     // Send out peripheralState at 2Hz
     if (rk.frame() % 50 == 0) {
+      const uint64_t publish_start_ns = nanos_since_boot();
       send_peripheral_state(peripheral_panda, &pm);
+      const uint64_t publish_us = (nanos_since_boot() - publish_start_ns) / 1000U;
+      loop_diag_publish_sum_us += publish_us;
+      loop_diag_publish_max_us = std::max(loop_diag_publish_max_us, publish_us);
+      loop_diag_publish_count++;
     }
 
     // Forward logs from pandas to cloudlog if available
+    const uint64_t serial_start_ns = nanos_since_boot();
     for (Panda *panda : pandas) {
       std::string log = panda->serial_read();
       if (!log.empty()) {
-        if (log.find("Register 0x") != std::string::npos) {
+        const bool has_register_fault = log.find("Register 0x") != std::string::npos;
+        const bool has_spi_diag = (log.find("SPI:") != std::string::npos) ||
+                                  (log.find("incorrect header") != std::string::npos) ||
+                                  (log.find("incorrect data checksum") != std::string::npos);
+        if (has_spi_diag) {
+          LOGW("panda_spi_serial_diag: %s", log.c_str());
+        }
+        if (has_register_fault) {
           // Log register divergent faults as errors
           LOGE("%s", log.c_str());
-        } else {
+        } else if (!has_spi_diag) {
           LOGD("%s", log.c_str());
         }
       }
+    }
+    const uint64_t serial_us = (nanos_since_boot() - serial_start_ns) / 1000U;
+    const uint64_t work_us = (nanos_since_boot() - loop_start_ns) / 1000U;
+    loop_diag_serial_sum_us += serial_us;
+    loop_diag_serial_max_us = std::max(loop_diag_serial_max_us, serial_us);
+    loop_diag_work_sum_us += work_us;
+    loop_diag_work_max_us = std::max(loop_diag_work_max_us, work_us);
+    loop_diag_work_slow += work_us > 10000U;
+    loop_diag_count++;
+
+    if (loop_diag_count >= 100U) {
+      const uint64_t peripheral_avg_us = loop_diag_peripheral_count > 0U ?
+        loop_diag_peripheral_sum_us / loop_diag_peripheral_count : 0U;
+      const uint64_t state_avg_us = loop_diag_state_count > 0U ?
+        loop_diag_state_sum_us / loop_diag_state_count : 0U;
+      const uint64_t publish_avg_us = loop_diag_publish_count > 0U ?
+        loop_diag_publish_sum_us / loop_diag_publish_count : 0U;
+      LOGW("pandad_aux_loop_diag: gap_max_us=%" PRIu64
+           ", peripheral_avg_us=%" PRIu64 ", peripheral_max_us=%" PRIu64
+           ", state_avg_us=%" PRIu64 ", state_max_us=%" PRIu64
+           ", publish_avg_us=%" PRIu64 ", publish_max_us=%" PRIu64
+           ", serial_avg_us=%" PRIu64 ", serial_max_us=%" PRIu64
+           ", work_avg_us=%" PRIu64 ", work_max_us=%" PRIu64 ", work_over_10ms=%u",
+           loop_diag_gap_max_us, peripheral_avg_us, loop_diag_peripheral_max_us,
+           state_avg_us, loop_diag_state_max_us,
+           publish_avg_us, loop_diag_publish_max_us,
+           loop_diag_serial_sum_us / loop_diag_count, loop_diag_serial_max_us,
+           loop_diag_work_sum_us / loop_diag_count, loop_diag_work_max_us, loop_diag_work_slow);
+      loop_diag_count = 0U;
+      loop_diag_peripheral_count = 0U;
+      loop_diag_state_count = 0U;
+      loop_diag_publish_count = 0U;
+      loop_diag_work_slow = 0U;
+      loop_diag_gap_max_us = 0U;
+      loop_diag_peripheral_sum_us = 0U;
+      loop_diag_peripheral_max_us = 0U;
+      loop_diag_state_sum_us = 0U;
+      loop_diag_state_max_us = 0U;
+      loop_diag_publish_sum_us = 0U;
+      loop_diag_publish_max_us = 0U;
+      loop_diag_serial_sum_us = 0U;
+      loop_diag_serial_max_us = 0U;
+      loop_diag_work_sum_us = 0U;
+      loop_diag_work_max_us = 0U;
     }
 
     rk.keepTime();
@@ -473,6 +688,7 @@ void pandad_run(std::vector<Panda *> &pandas) {
     }
   }
 
+  recv_thread.join();
   send_thread.join();
 }
 
