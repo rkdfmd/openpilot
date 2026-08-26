@@ -1,11 +1,13 @@
 import pytest
 
 from openpilot.selfdrive.carrot.traffic_stop import (
+  TrafficStopDistanceTracker,
   get_traffic_stop_accel_floor,
   get_traffic_stop_obstacle_distance,
   get_traffic_stop_reference_speed,
   get_virtual_traffic_stop_distance,
   is_traffic_stop_entry_allowed,
+  should_limit_traffic_stop_accel,
 )
 
 
@@ -58,13 +60,48 @@ def test_configured_obstacle_adjustment_is_used_at_all_speeds():
 def test_signal_stop_accel_floor_limits_early_braking_with_margin():
   # Supplied d76 route: 78.52 km/h and about 138.5 m available at detection.
   accel_floor = get_traffic_stop_accel_floor(78.52 / 3.6, 138.5, 5.5)
-  assert accel_floor == pytest.approx(-2.2314, abs=1e-4)
+  assert accel_floor == -2.2
+
+
+def test_signal_stop_accel_floor_limits_d85_onset_to_comfortable_braking():
+  # Supplied d85 route: 76.41 km/h with about 137 m to the physical stop line.
+  accel_floor = get_traffic_stop_accel_floor(76.41 / 3.6, 137.0, 5.5)
+  assert accel_floor == -2.2
+
+
+def test_signal_stop_accel_floor_ignores_dbd_model_endpoint_contraction():
+  # Supplied dbd route started at 78.23 km/h with about 155 m to the physical
+  # line. Even a persistently contracted 96 m model endpoint is not yet an
+  # emergency and must not recreate the observed -3.01 m/s^2 initial request.
+  accel_floor = get_traffic_stop_accel_floor(78.23 / 3.6, 96.0, 5.5)
+  assert accel_floor == -2.2
+
+
+def test_signal_stop_accel_floor_blends_between_comfort_and_emergency():
+  # Choose the distance so buffered required decel is exactly 4.5 m/s^2,
+  # halfway through the 4.0..5.0 emergency release interval.
+  accel_floor = get_traffic_stop_accel_floor(20.0, 67.0116279070, 5.5)
+  assert accel_floor == pytest.approx(-3.1)
 
 
 def test_signal_stop_accel_floor_releases_when_distance_is_short():
-  accel_floor = get_traffic_stop_accel_floor(62.0 / 3.6, 60.0, 5.5)
-  assert accel_floor < -3.8
+  accel_floor = get_traffic_stop_accel_floor(62.0 / 3.6, 50.0, 5.5)
+  assert accel_floor == -4.0
   assert get_traffic_stop_accel_floor(20.0, 10.0, 5.5) == -4.0
+
+
+def test_signal_stop_accel_floor_keeps_a_close_stop_safely_reachable():
+  # Worst-case check: treat the contracted dbd endpoint as a real 80 m line.
+  # The strongest braking permitted by this floor still stops before the line.
+  v_ego = 78.23 / 3.6
+  raw_stop_distance = 80.0
+  dt = 0.01
+  while v_ego > 0.01:
+    accel = get_traffic_stop_accel_floor(v_ego, raw_stop_distance, 5.5)
+    raw_stop_distance -= v_ego * dt
+    v_ego = max(0.0, v_ego + accel * dt)
+
+  assert 5.5 < raw_stop_distance < 15.0
 
 
 def test_signal_stop_accel_floor_fails_safe_for_invalid_distance():
@@ -75,6 +112,39 @@ def test_signal_stop_accel_floor_releases_monotonically_as_margin_shrinks():
   floors = [get_traffic_stop_accel_floor(20.0, distance, 5.5) for distance in range(20, 201)]
   assert all(-4.0 <= floor <= -2.2 for floor in floors)
   assert floors == sorted(floors)
+
+
+def test_stop_distance_tracker_rejects_a_transient_nearer_line_in_world_coordinates():
+  tracker = TrafficStopDistanceTracker(sample_count=4)
+  assert tracker.update(100.0, 0.0) == pytest.approx(100.0)
+  assert tracker.update(99.0, 1.0) == pytest.approx(99.0)
+  assert tracker.update(70.0, 1.0) == pytest.approx(98.0)
+  assert tracker.update(97.0, 1.0) == pytest.approx(97.0)
+
+
+def test_stop_distance_tracker_accepts_a_persistent_nearer_line():
+  tracker = TrafficStopDistanceTracker(sample_count=3)
+  tracker.update(100.0, 0.0)
+  assert tracker.update(70.0, 1.0) == pytest.approx(99.0)
+  assert tracker.update(69.0, 1.0) == pytest.approx(98.0)
+  assert tracker.update(68.0, 1.0) == pytest.approx(68.0)
+
+
+def test_stop_distance_tracker_accepts_a_farther_line_immediately():
+  tracker = TrafficStopDistanceTracker(sample_count=4)
+  tracker.update(100.0, 0.0)
+  assert tracker.update(110.0, 1.0) == pytest.approx(110.0)
+
+
+@pytest.mark.parametrize("source", ["cruise", "e2e"])
+def test_signal_stop_accel_limit_covers_both_signal_sources(source):
+  assert should_limit_traffic_stop_accel(True, source)
+
+
+@pytest.mark.parametrize("source", ["lead0", "lead1"])
+def test_signal_stop_accel_limit_yields_to_real_lead_sources(source):
+  assert not should_limit_traffic_stop_accel(True, source)
+  assert not should_limit_traffic_stop_accel(False, "e2e")
 
 
 @pytest.mark.parametrize("steering_angle_deg", [-49.9, -20.0, 0.0, 20.0, 49.9])

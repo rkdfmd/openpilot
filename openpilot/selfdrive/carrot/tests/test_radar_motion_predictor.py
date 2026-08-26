@@ -13,6 +13,7 @@ from openpilot.selfdrive.carrot.radar_motion.predictor import (
   RadarMotionHistorySample,
   RadarMotionPrediction,
   RadarMotionPredictor,
+  corner_cutin_predecel_score,
   cutin_probability_at,
   model_path_point_at_s,
   model_path_y,
@@ -2938,6 +2939,81 @@ def test_controller_publishes_strong_corner_cutin_predecel_before_lead_two() -> 
   assert output.lead_cutin_risk["vRel"] == pytest.approx(-6.5)
 
 
+def test_close_low_speed_cutin_predecel_uses_moving_cross_sensor_target() -> None:
+  prediction = SimpleNamespace(
+    sensor="corner",
+    source="corner180",
+    current_path_occupancy=False,
+    history_count=40,
+    d_path=-2.40,
+    d_path_rate_short=0.36,
+    d_path_rate_long=0.41,
+    reported_normal_speed=0.26,
+    directional_inward_displacement_m=0.34,
+    directional_consistency=0.96,
+    directional_inward_sample_ratio=0.75,
+    motion_consistency=0.83,
+    recent_motion_support=0.87,
+  )
+
+  score = corner_cutin_predecel_score(
+    prediction,
+    3.10,
+    -2.00,
+    v_ego=7.69,
+    cross_sensor_confirmed=True,
+  )
+
+  assert score >= 0.20
+  assert corner_cutin_predecel_score(
+    prediction,
+    3.10,
+    -2.00,
+    v_ego=7.69,
+    cross_sensor_confirmed=False,
+  ) == 0.0
+
+
+@pytest.mark.parametrize(
+  ("v_ego", "v_rel", "prediction_overrides"),
+  (
+    (15.0, -2.0, {}),
+    (7.69, -7.69, {}),
+    (7.69, -2.0, {"reported_normal_speed": 0.0}),
+    (7.69, -2.0, {"directional_consistency": 0.70}),
+  ),
+)
+def test_close_low_speed_cutin_predecel_rejects_unsafe_shortcuts(
+  v_ego: float,
+  v_rel: float,
+  prediction_overrides: dict[str, float],
+) -> None:
+  values = {
+    "sensor": "corner",
+    "source": "corner180",
+    "current_path_occupancy": False,
+    "history_count": 40,
+    "d_path": -2.40,
+    "d_path_rate_short": 0.36,
+    "d_path_rate_long": 0.41,
+    "reported_normal_speed": 0.26,
+    "directional_inward_displacement_m": 0.34,
+    "directional_consistency": 0.96,
+    "directional_inward_sample_ratio": 0.75,
+    "motion_consistency": 0.83,
+    "recent_motion_support": 0.87,
+  }
+  values.update(prediction_overrides)
+
+  assert corner_cutin_predecel_score(
+    SimpleNamespace(**values),
+    3.10,
+    v_rel,
+    v_ego=v_ego,
+    cross_sensor_confirmed=True,
+  ) == 0.0
+
+
 def test_controller_selects_cross_sensor_slow_close_cutin() -> None:
   controller = DPathRadarController(prefer_corner_radar=True)
   output = None
@@ -3546,6 +3622,44 @@ def test_radar_only_stationary_corner_requires_half_second_confirmation() -> Non
 
   assert match is not None
   assert match.point.track_id == 1009
+
+
+def test_radar_only_stationary_corner_range_jumps_restart_confirmation() -> None:
+  matcher = VisionRadarMatcher()
+  ranges_m = (
+    23.20, 21.55, 20.75, 18.30, 18.30, 15.95, 17.35, 16.55,
+    14.90, 13.35, 11.70, 10.50, 8.80, 8.75, 6.30, 9.25,
+    6.80, 6.80, 3.55, 1.05,
+  )
+  lateral_m = (
+    -0.70, -0.65, -0.60, -0.50, -0.50, -0.40, -0.40, -0.40,
+    -0.35, -0.30, -0.25, -0.20, -0.10, -0.15, -0.10, -0.10,
+    -0.05, -0.05, -0.05, 0.0,
+  )
+
+  for index, (d_rel, y_rel) in enumerate(zip(
+    ranges_m, lateral_m, strict=True,
+  )):
+    point = snapshot_radar_points((Point(
+      1910,
+      d_rel,
+      y_rel,
+      v_rel=-29.8,
+      v_lead=-0.4,
+      source="corner235",
+    ),), v_ego=29.4)[0]
+    match = matcher.match(
+      model_with_lead(115.0, 8.5, 30.0, probability=0.002),
+      (),
+      STRAIGHT_PATH,
+      time_s=index * 0.05,
+      stationary_points=(point,),
+      prefer_corner_stationary=True,
+    )
+
+    assert match is None
+
+  assert matcher.stationary_identity is None
 
 
 def test_radar_only_stationary_pending_resets_after_center_support_loss() -> None:
