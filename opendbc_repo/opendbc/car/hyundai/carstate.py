@@ -29,10 +29,14 @@ VEHICLE_NAVI_PASSED_EVENT_DISTANCE = 30.0
 VEHICLE_NAVI_MAX_EVENTS = 32
 VEHICLE_NAVI_MAX_CURVES = 64
 VEHICLE_NAVI_CAMERA_KINDS = (0, 1, 2)
+VEHICLE_NAVI_CONTROLLED_ACCESS_LINK_CLASSES = (1, 2, 3)  # Freeway, IC, JC
+VEHICLE_NAVI_CONTROLLED_ACCESS_ROAD_CLASSES = (1, 2)  # Freeway, arterial/city freeway
 VEHICLE_NAVI_SCHOOL_ZONE_MAX_DISTANCE = 1000.0
 VEHICLE_NAVI_POSITION_TIMEOUT_NS = 1_000_000_000
 VEHICLE_NAVI_CURVE_MAX_DISTANCE = 1500.0
-VEHICLE_NAVI_CURVE_END_FALLBACK_DISTANCE = 120.0
+VEHICLE_NAVI_CURVE_DISTANCE_FACTOR = 2.0
+VEHICLE_NAVI_CURVE_SHORT_SPOT_MAX_DISTANCE = 10.0
+VEHICLE_NAVI_CURVE_SHORT_SPOT_MAX_SPEED = 20.0
 VEHICLE_NAVI_CURVE_TARGET_LAT_ACCEL = 1.9
 STANDSTILL_THRESHOLD = 12 * 0.03125 * CV.KPH_TO_MS
 CANFD_AVH_RELEASE_GRACE_FRAMES = round(0.5 / DT_CTRL)
@@ -212,7 +216,7 @@ class CarState(CarStateBase):
     self.vehicleNaviCurveSpeedFactor = min(2.0, max(0.5, self.op_params.get_int("VehicleNaviCurveSpeedFactor") * 0.01))
     self.vehicleNaviCurveLowerLimit = max(5.0, self.op_params.get_int("AutoCurveSpeedLowerLimit"))
     self.vehicleNaviCurveDecelRate = max(0.01, self.op_params.get_int("AutoNaviSpeedDecelRate") * 0.01)
-    self.vehicleNaviCurveControlEnd = max(0.0, self.op_params.get_int("AutoNaviSpeedCtrlEnd"))
+    self.vehicleNaviCurveControlEnd = max(0.0, self.op_params.get_int("VehicleNaviCurveCtrlEnd"))
     self.vehicleSpeedCameraParamsCounter = 0
     self.vehicleNaviEvents = []
     self.vehicleNaviCurves = []
@@ -223,6 +227,7 @@ class CarState(CarStateBase):
     self.vehicleNaviRouteResetTimestamp = 0
     self.vehicleNaviCurveRouteActive = False
     self.vehicleNaviCurveRouteState = 3
+    self.vehicleNaviRoadClass = 7
     self.vehicleNaviCameraTarget = None
     self.vehicleNaviSpeedZoneActive = False
     self.vehicleNaviSpeedZoneSpeed = 0.0
@@ -624,7 +629,7 @@ class CarState(CarStateBase):
     self.vehicleNaviCurveSpeedFactor = min(2.0, max(0.5, self.op_params.get_int("VehicleNaviCurveSpeedFactor") * 0.01))
     self.vehicleNaviCurveLowerLimit = max(5.0, self.op_params.get_int("AutoCurveSpeedLowerLimit"))
     self.vehicleNaviCurveDecelRate = max(0.01, self.op_params.get_int("AutoNaviSpeedDecelRate") * 0.01)
-    self.vehicleNaviCurveControlEnd = max(0.0, self.op_params.get_int("AutoNaviSpeedCtrlEnd"))
+    self.vehicleNaviCurveControlEnd = max(0.0, self.op_params.get_int("VehicleNaviCurveCtrlEnd"))
     vehicle_navi_can_control = self.op_params.get_bool("VehicleNaviCanControl")
     if vehicle_navi_can_control != self.vehicleNaviCanControl:
       self.vehicleNaviCanControl = vehicle_navi_can_control
@@ -664,7 +669,13 @@ class CarState(CarStateBase):
     return {
       "offset": raw & 0x1fff,
       "calculated_route": (raw >> 22) & 0x3,
+      "functional_road_class": (raw >> 24) & 0x7,
     }
+
+  def _vehicle_navi_is_controlled_access_road(self):
+    link_class = int(self.hda_info_4a3.get("LinkClass", 0)) if self.hda_info_4a3 is not None else 0
+    return (link_class in VEHICLE_NAVI_CONTROLLED_ACCESS_LINK_CLASSES or
+            self.vehicleNaviRoadClass in VEHICLE_NAVI_CONTROLLED_ACCESS_ROAD_CLASSES)
 
   @staticmethod
   def _decode_vehicle_navi_profile(values):
@@ -710,6 +721,7 @@ class CarState(CarStateBase):
       return None
 
     offset = int(values.get("PROSHORT_OFFSET", 8191))
+    distance = int(values.get("PROSHORT_DISTANCE", 1023))
     raw_curvature = int(values.get("PROSHORT_VALUE_0", 1023))
     if not 0 <= offset <= VEHICLE_NAVI_CURVE_MAX_DISTANCE or raw_curvature == 1023:
       return None
@@ -719,6 +731,7 @@ class CarState(CarStateBase):
       return None
     return {
       "offset": offset,
+      "span": distance * VEHICLE_NAVI_CURVE_DISTANCE_FACTOR if 0 <= distance < 1023 else 0.0,
       "curvature": curvature,
       "raw_curvature": raw_curvature,
     }
@@ -732,11 +745,18 @@ class CarState(CarStateBase):
   def _add_vehicle_navi_curve(self, curve):
     target = self.totalDistance + curve["offset"]
     reference_speed = self._vehicle_navi_curve_reference_speed(curve["curvature"])
+    # A single 10 m map node with a hairpin-level value is commonly a turn-node
+    # discontinuity, not a road curve long enough to justify an 18 km/h cap.
+    # Normal 10 m curve samples remain usable; only the saturated low-speed spot
+    # is ignored here. Route/TBT turn control continues to handle real turns.
+    short_spot = 0.0 < curve["span"] <= VEHICLE_NAVI_CURVE_SHORT_SPOT_MAX_DISTANCE
+    if short_spot and reference_speed <= VEHICLE_NAVI_CURVE_SHORT_SPOT_MAX_SPEED:
+      return
     nearest = min(self.vehicleNaviCurves, key=lambda item: abs(item["target"] - target), default=None)
     if nearest is not None and abs(nearest["target"] - target) <= 2.0:
-      nearest.update(target=target, curvature=curve["curvature"], speed=reference_speed)
+      nearest.update(target=target, span=curve["span"], curvature=curve["curvature"], speed=reference_speed)
     else:
-      self.vehicleNaviCurves.append({"target": target, "curvature": curve["curvature"], "speed": reference_speed})
+      self.vehicleNaviCurves.append({"target": target, "span": curve["span"], "curvature": curve["curvature"], "speed": reference_speed})
     self.vehicleNaviCurves.sort(key=lambda item: item["target"])
     self.vehicleNaviCurves = self.vehicleNaviCurves[:VEHICLE_NAVI_MAX_CURVES]
 
@@ -755,23 +775,14 @@ class CarState(CarStateBase):
         if curve is not None and timestamp > self.vehicleNaviRouteResetTimestamp:
           self._add_vehicle_navi_curve(curve)
 
-    # Keep passed curve spots until a following near-straight spot identifies the
-    # actual curve end. This avoids releasing the speed cap at an arbitrary
-    # distance after the apex while the vehicle is still in the curve.
-    self.vehicleNaviCurves = [curve for curve in self.vehicleNaviCurves
-                              if curve["target"] >= self.totalDistance - VEHICLE_NAVI_CURVE_END_FALLBACK_DISTANCE]
+    # Release each curvature spot as soon as its apex is passed. The following
+    # lower-curvature spots then raise the target speed before the curve exit.
+    self.vehicleNaviCurves = [curve for curve in self.vehicleNaviCurves if curve["target"] >= self.totalDistance]
     candidates = []
     for curve in self.vehicleNaviCurves:
       if curve["speed"] >= 250:
         continue
       distance = curve["target"] - self.totalDistance
-      if distance < 0:
-        curve_end = next((point["target"] for point in self.vehicleNaviCurves
-                          if point["target"] > curve["target"] and point["speed"] >= 250), None)
-        hold_until = curve_end if curve_end is not None else curve["target"] + VEHICLE_NAVI_CURVE_END_FALLBACK_DISTANCE
-        if self.totalDistance >= hold_until:
-          continue
-        distance = 0.0
       target_speed = max(self.vehicleNaviCurveLowerLimit, curve["speed"] * self.vehicleNaviCurveSpeedFactor)
       safe_speed = target_speed / CV.MS_TO_KPH
       decel_distance = max(0.0, distance - safe_speed * self.vehicleNaviCurveControlEnd)
@@ -848,6 +859,8 @@ class CarState(CarStateBase):
       if timestamp > self.vehicleNaviSegmentTimestamp:
         self.vehicleNaviSegmentTimestamp = timestamp
         segment = self._decode_vehicle_navi_segment(self.navi_segment_4b9)
+        if segment["functional_road_class"] != 7:
+          self.vehicleNaviRoadClass = segment["functional_road_class"]
         if segment["calculated_route"] == 1:
           if self.vehicleNaviCurveRouteState != 1:
             self._clear_vehicle_navi_curves()
@@ -868,6 +881,9 @@ class CarState(CarStateBase):
           self._clear_vehicle_navi_school_zone()
 
     self._update_vehicle_navi_curve_profile(cp, ret)
+    on_controlled_access_road = self._vehicle_navi_is_controlled_access_road()
+    if on_controlled_access_road:
+      self._clear_vehicle_navi_school_zone()
     if not (self.vehicleNaviCanControl or self.vehicleNaviSchoolZoneControl):
       return False
 
@@ -883,13 +899,14 @@ class CarState(CarStateBase):
               self.vehicleNaviSpeedZoneActive = True
               self.vehicleNaviSpeedZoneSpeed = event[1]
             if self.vehicleNaviSchoolZoneControl:
-              if event[1] == 30:
+              if event[1] == 30 and not on_controlled_access_road:
                 self.vehicleNaviSchoolZoneActive = True
                 self.vehicleNaviSchoolZoneStartDistance = self.totalDistance
                 self.vehicleNaviSchoolZoneUsesCameraStatus = speed_limit_cam and ret.speedLimit == 30
               else:
                 self._clear_vehicle_navi_school_zone()
-          elif self.vehicleNaviCanControl:
+          elif self.vehicleNaviCanControl and (not on_controlled_access_road or
+                                               (event[0] != "bump" and not (event[0] == "camera" and event[1] == 30))):
             self._add_vehicle_navi_event(*event, profile["offset"])
 
     if position_seen:
@@ -900,7 +917,9 @@ class CarState(CarStateBase):
         self.vehicleNaviSpeedZoneSpeed = ret.speedLimit
 
     self.vehicleNaviEvents = [event for event in self.vehicleNaviEvents
-                              if event["target"] >= self.totalDistance - VEHICLE_NAVI_PASSED_EVENT_DISTANCE]
+                              if event["target"] >= self.totalDistance - VEHICLE_NAVI_PASSED_EVENT_DISTANCE and
+                              (not on_controlled_access_road or
+                               (event["type"] != "bump" and not (event["type"] == "camera" and event["speed"] == 30)))]
     upcoming = [event for event in self.vehicleNaviEvents if event["target"] > self.totalDistance]
 
     bumps = [event for event in upcoming if event["type"] == "bump"]
@@ -917,7 +936,7 @@ class CarState(CarStateBase):
       if camera_status_ended or distance_expired:
         self._clear_vehicle_navi_school_zone()
 
-    if self.vehicleNaviSchoolZoneControl and self.vehicleNaviSchoolZoneActive:
+    if self.vehicleNaviSchoolZoneControl and self.vehicleNaviSchoolZoneActive and not on_controlled_access_road:
       ret.schoolZoneActive = True
       ret.speedLimit = 30
       if self.vehicleNaviCanControl:
@@ -947,6 +966,8 @@ class CarState(CarStateBase):
   def update_speed_limit(self, ret, speed_limit_cam, distance_time_changed=None):
     if distance_time_changed is None:
       distance_time_changed = self._update_vehicle_speed_camera_params()
+    if self._vehicle_navi_is_controlled_access_road() and ret.speedLimit == 30:
+      speed_limit_cam = False
     self.totalDistance += ret.vEgo * DT_CTRL
     if ret.speedLimit > 0 and speed_limit_cam and self.vehicleNaviCanControl and self.vehicleNaviCameraTarget is not None:
       self.speedLimitDistance = self.vehicleNaviCameraTarget
