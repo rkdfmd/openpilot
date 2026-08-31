@@ -70,6 +70,12 @@ from openpilot.selfdrive.carrot.radar_motion.occupancy_v2 import (
   RadarOccupancyModelV2,
   early_control_eligible,
 )
+from openpilot.selfdrive.carrot.radar_motion.occupancy_v3 import (
+  RadarOccupancyModelV3,
+  V3Estimate,
+  V3Evidence,
+  V3Stage,
+)
 
 
 RADAR_TO_CAMERA = 1.52
@@ -101,7 +107,7 @@ STATIONARY_HANDOFF_MAX_YREL_DELTA_M = 1.5
 VALIDATION_SETTINGS_ENV = "CARROT_RADAR_VALIDATION_SETTINGS"
 VALIDATION_MOTION_MODES = ("normal", "front")
 VALIDATION_DEFAULT_SENSITIVITY = 3
-VISUAL_REPLAY_CACHE_VERSION = 1
+VISUAL_REPLAY_CACHE_VERSION = 3
 LEAD_ONE_RADAR_RGB = (246, 142, 55)
 LEAD_ONE_VISION_RGB = (72, 145, 255)
 LEAD_ONE_VISION_WEAK_RGB = (104, 205, 255)
@@ -128,6 +134,23 @@ def radar_replay_source_fingerprint() -> str:
     *sorted((CARROT_ROOT / "radar_motion").glob("*.py")),
   )
   for source_path in source_files:
+    digest.update(str(source_path.relative_to(REPO_ROOT)).encode("utf-8"))
+    digest.update(source_path.read_bytes())
+  return digest.hexdigest()[:20]
+
+
+def radar_replay_baseline_source_fingerprint() -> str:
+  """Fingerprint V1/V2 replay sources without V3 shadow-only code."""
+  digest = hashlib.sha256()
+  replay_source = Path(__file__).read_text(encoding="utf-8")
+  v3_start = replay_source.index("\ndef _v3_candidate(")
+  v3_end = replay_source.index("\ndef visual_replay_cache_path(")
+  ui_start = replay_source.index("\nclass SimulatorUI:")
+  replay_source = replay_source[:v3_start] + replay_source[v3_end:ui_start]
+  digest.update(replay_source.encode("utf-8"))
+  for source_path in sorted((CARROT_ROOT / "radar_motion").glob("*.py")):
+    if source_path.name == "occupancy_v3.py":
+      continue
     digest.update(str(source_path.relative_to(REPO_ROOT)).encode("utf-8"))
     digest.update(source_path.read_bytes())
   return digest.hexdigest()[:20]
@@ -946,6 +969,7 @@ def _controller_candidate(
   lead: dict[str, Any] | None,
   reason: str,
   continuity_by_identity: Mapping[tuple[str, int], int] | None = None,
+  track_aliases: Iterable[int] = (),
 ) -> Candidate | None:
   if lead is None or not lead.get("status"):
     return None
@@ -964,6 +988,36 @@ def _controller_candidate(
     default=None,
   )
   source = matched_point.source if matched_point is not None else ""
+  aliases: tuple[int, ...] = tuple(
+    sorted({int(value) for value in track_aliases if int(value) != track_id})
+  )
+  if matched_point is not None:
+    counterpart_is_front = matched_point.source.startswith("corner")
+    counterparts = tuple(
+      (
+        abs(point.d_rel - matched_point.d_rel) / 5.0
+        + abs(point.y_rel - matched_point.y_rel) / 2.0
+        + abs(point.v_lead - matched_point.v_lead) / 2.5,
+        point,
+      )
+      for point in frame.points
+      if (
+        point.measured
+        and (
+          point.source == "frontRadar"
+          if counterpart_is_front
+          else point.source.startswith("corner")
+        )
+        and abs(point.d_rel - matched_point.d_rel) <= 5.0
+        and abs(point.y_rel - matched_point.y_rel) <= 2.0
+        and abs(point.v_lead - matched_point.v_lead) <= 2.5
+      )
+    )
+    if counterparts:
+      aliases = tuple(sorted({
+        *aliases,
+        min(counterparts, key=lambda value: value[0])[1].track_id,
+      }))
   return Candidate(
     track_id=track_id,
     score=float(lead.get("score", lead.get("modelProb", 0.0))),
@@ -972,6 +1026,7 @@ def _controller_candidate(
     y_rel=y_rel,
     v_lead=float(lead.get("vLead", 0.0)),
     source=source,
+    track_aliases=aliases,
     continuity_id=(
       continuity_by_identity.get((source, track_id))
       if continuity_by_identity is not None
@@ -1199,9 +1254,6 @@ class RadarMotionShadowSelector:
               vision is not None
               and vision_only_lead_allowed(
                 self.enable_radar_tracks,
-                side_cutin_supported=(
-                  matcher.vision_only_side_cutin_supported
-                ),
               )
             )
             else None
@@ -2078,6 +2130,224 @@ class RadarOccupancyV2Selector:
     return self.selections[frame_index]
 
 
+def _v3_candidate(
+  estimate: V3Estimate,
+  candidate: Candidate,
+) -> Candidate:
+  evidence: V3Evidence = estimate.evidence
+  occupancy = evidence.occupancy
+  overlap = (
+    "--" if occupancy.time_to_overlap_s is None
+    else f"{occupancy.time_to_overlap_s:.2f}s"
+  )
+  return replace(
+    candidate,
+    score=estimate.score,
+    reason=f"V3 {estimate.reason}",
+    stage=estimate.stage.name,
+    detail=" ".join((
+      f"{estimate.reason} risk={occupancy.risk_score:.2f}",
+      f"lead={occupancy.lead_score:.2f}",
+      f"intent={occupancy.intent_score:.2f}",
+      f"conf={occupancy.confidence:.2f}",
+      f"urgency={occupancy.control_urgency:.2f}",
+      f"inward={occupancy.inward_rate_mps:.2f} eta={overlap}",
+    )),
+  )
+
+
+class RadarOccupancyV3Selector:
+  """V2 safety floor plus independent staged V3 control extensions."""
+
+  name = "radar-occupancy-v3"
+
+  def __init__(
+    self,
+    frames: Sequence[RadarFrame],
+    *,
+    baseline: RadarMotionShadowSelector | None = None,
+    v2_selector: RadarOccupancyV2Selector | None = None,
+    enable_radar_tracks: int = 2,
+    cut_in_sensitivity: int = VALIDATION_DEFAULT_SENSITIVITY,
+  ) -> None:
+    baseline = baseline or RadarMotionShadowSelector(
+      frames,
+      cut_in_sensitivity=cut_in_sensitivity,
+      enable_radar_tracks=enable_radar_tracks,
+    )
+    v2_selector = v2_selector or RadarOccupancyV2Selector(
+      frames,
+      baseline=baseline,
+      enable_radar_tracks=enable_radar_tracks,
+    )
+    model = RadarOccupancyModelV3()
+    associator = FrontRadarKinematicAssociator()
+    lead_two_tracker = DPathLeadTwoTracker()
+    selections: list[Selection] = []
+    estimate_series: list[tuple[V3Estimate, ...]] = []
+
+    for index, (frame, predictions, primary, base_selection, v2_estimates) in enumerate(zip(
+      frames,
+      baseline.trajectories,
+      baseline.lead_one_outputs,
+      v2_selector.selections,
+      v2_selector.estimates,
+      strict=True,
+    )):
+      estimates = model.update(frame.time_s, v2_estimates)
+      estimate_series.append(estimates)
+      all_points = radar_points_at_model_time(frame)
+      front_matches = associator.update(all_points)
+      selected_points = baseline.motion_points[index]
+      point_by_identity = {
+        (point.source, point.track_id): point for point in selected_points
+      }
+      point_by_identity.update({
+        (point.source, point.track_id): point
+        for point in all_points
+        if (point.source, point.track_id) in predictions
+      })
+      base_candidates = {
+        (candidate.source, candidate.continuity_id): candidate
+        for candidate in base_selection.cutin_diagnostics
+      }
+      v3_by_identity = {
+        estimate.evidence.identity: estimate for estimate in estimates
+      }
+      diagnostics = tuple(
+        _v3_candidate(v3_by_identity[identity], candidate)
+        if identity in v3_by_identity else candidate
+        for identity, candidate in base_candidates.items()
+      )
+
+      extra_limits = []
+      extra_decisions = []
+      lead_candidates = []
+      continuity_by_identity = {}
+      for estimate in estimates:
+        if estimate.reason == "baseline" or estimate.stage < V3Stage.PREDECEL:
+          continue
+        occupancy = estimate.evidence.occupancy
+        evidence = occupancy.evidence
+        identity = evidence.source, evidence.track_id
+        prediction = predictions.get(identity)
+        point = point_by_identity.get(identity)
+        candidate = base_candidates.get(evidence.identity)
+        if prediction is None or point is None or candidate is None:
+          continue
+        lead_point = prefer_front_radar_kinematics(
+          point, all_points, front_matches,
+        )
+        lead_d_path = (
+          project_to_model_path(
+            frame.path, lead_point.d_rel, lead_point.y_rel,
+          ).d_path
+          if lead_point is not point else prediction.d_path
+        )
+        lead = lead_from_radar_point(
+          lead_point, lead_d_path, 0.03, estimate.score,
+        )
+        if lead_duplicates_primary(lead, primary) or not cutin_can_compete_with_primary(
+          lead,
+          primary,
+          projected_path_entry=True,
+          entry_horizon_s=occupancy.time_to_overlap_s,
+        ):
+          continue
+        v3_candidate = _v3_candidate(estimate, candidate)
+        extra_limits.append(v3_candidate)
+        continuity_by_identity[identity] = prediction.continuity_id
+        if estimate.stage >= V3Stage.LEAD:
+          extra_decisions.append(v3_candidate)
+          lead_candidates.append(DPathLeadCandidate(
+            lead=lead,
+            source=prediction.source,
+            track_id=prediction.track_id,
+            continuity_id=prediction.continuity_id,
+            retainable=True,
+            confirmed_cutin=True,
+          ))
+
+      lead_selection = lead_two_tracker.update(
+        frame.time_s, primary, lead_candidates, frame.v_ego,
+      )
+      v3_lead_two = _controller_candidate(
+        frame,
+        lead_selection.lead_two,
+        "RadarOccupancy V3 leadTwo",
+        continuity_by_identity,
+      )
+      lead_two = v3_lead_two or base_selection.lead_two
+      base_decision_keys = {
+        (candidate.source, candidate.track_id)
+        for candidate in base_selection.decision_cutin_candidates
+      }
+      decision = base_selection.decision_cutin_candidates + tuple(
+        candidate for candidate in extra_decisions
+        if (candidate.source, candidate.track_id) not in base_decision_keys
+      )
+      selected_ids = {
+        int(lead["radarTrackId"]) for lead in lead_selection.cutins
+      }
+      active = base_selection.active_cutin_candidates + tuple(
+        candidate for candidate in extra_decisions
+        if candidate.track_id in selected_ids
+      )
+      predecel = min(
+        (
+          *extra_limits,
+          *(
+            () if base_selection.cutin_predecel_candidate is None
+            else (base_selection.cutin_predecel_candidate,)
+          ),
+        ),
+        key=lambda candidate: (
+          candidate.d_rel if candidate.d_rel is not None else math.inf
+        ),
+        default=None,
+      )
+      selections.append(Selection(
+        lead_one=base_selection.lead_one,
+        lead_two=lead_two,
+        front_candidates=tuple(
+          candidate for candidate in diagnostics
+          if not candidate.source.startswith("corner")
+        ),
+        corner_candidates=tuple(
+          candidate for candidate in diagnostics
+          if candidate.source.startswith("corner")
+        ),
+        cutin_diagnostics=diagnostics,
+        decision_cutin_candidates=decision,
+        active_cutin_candidates=active,
+        external_candidates=decision,
+        active_external_candidates=active,
+        cutin_predecel_candidate=predecel,
+      ))
+
+    self.motion_sensor = baseline.motion_sensor
+    self.enable_radar_tracks = baseline.enable_radar_tracks
+    self.cut_in_sensitivity = baseline.cut_in_sensitivity
+    self.motion_sensitivity = baseline.motion_sensitivity
+    self.decision_threshold = baseline.decision_threshold
+    self.maximum_lookahead_s = baseline.maximum_lookahead_s
+    self.motion_points = baseline.motion_points
+    self.trajectories = baseline.trajectories
+    self.lead_one_outputs = baseline.lead_one_outputs
+    self.baseline = baseline
+    self.v2_selector = v2_selector
+    self.estimates = tuple(estimate_series)
+    self.selections = tuple(selections)
+
+  def select(
+    self, frame: RadarFrame, frame_index: int | None = None,
+  ) -> Selection:
+    del frame
+    if frame_index is None:
+      raise ValueError("occupancy V3 selector requires a frame index")
+    return self.selections[frame_index]
+
+
 def visual_replay_cache_path(
   cache_dir: Path,
   log_path: Path,
@@ -2108,6 +2378,8 @@ def save_visual_replay_cache(
   cache_path: Path,
   frames: list[RadarFrame],
   selector: RadarOccupancyV2Selector,
+  v3_selector: RadarOccupancyV3Selector,
+  production_selector: ProductionDPathSelector,
 ) -> None:
   """Atomically save a fully built replay for the foreground reviewer."""
   cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2122,6 +2394,8 @@ def save_visual_replay_cache(
           "source_fingerprint": radar_replay_source_fingerprint(),
           "frames": frames,
           "selector": selector,
+          "v3_selector": v3_selector,
+          "production_selector": production_selector,
         },
         cache_file,
         protocol=pickle.HIGHEST_PROTOCOL,
@@ -2133,7 +2407,12 @@ def save_visual_replay_cache(
 
 def load_visual_replay_cache(
   cache_path: Path,
-) -> tuple[list[RadarFrame], RadarOccupancyV2Selector] | None:
+) -> tuple[
+  list[RadarFrame],
+  RadarOccupancyV2Selector,
+  RadarOccupancyV3Selector,
+  ProductionDPathSelector,
+] | None:
   """Load a prepared replay, returning None for stale or damaged data."""
   if not cache_path.is_file():
     return None
@@ -2147,9 +2426,18 @@ def load_visual_replay_cache(
       != radar_replay_source_fingerprint()
       or not isinstance(payload.get("frames"), list)
       or not isinstance(payload.get("selector"), RadarOccupancyV2Selector)
+      or not isinstance(payload.get("v3_selector"), RadarOccupancyV3Selector)
+      or not isinstance(
+        payload.get("production_selector"), ProductionDPathSelector,
+      )
     ):
       return None
-    return payload["frames"], payload["selector"]
+    return (
+      payload["frames"],
+      payload["selector"],
+      payload["v3_selector"],
+      payload["production_selector"],
+    )
   except (EOFError, OSError, pickle.PickleError, AttributeError, TypeError):
     return None
 
@@ -2271,13 +2559,13 @@ def _copy_recorded_lead(lead: Any) -> RecordedLead:
   )
 
 
-def _production_controller_outputs(
+def _production_controller_replay(
   frames: Sequence[RadarFrame],
   *,
   motion_sensor: str,
   enable_radar_tracks: int,
   cut_in_sensitivity: int,
-) -> tuple[Any, ...]:
+) -> tuple[tuple[Any, ...], tuple[tuple[Any, ...], ...]]:
   """Replay the real dPath controller for option-dependent lead roles."""
   controller = DPathRadarController(
     prefer_corner_radar=motion_sensor == "corner",
@@ -2285,6 +2573,7 @@ def _production_controller_outputs(
     cut_in_sensitivity=cut_in_sensitivity,
   )
   outputs = []
+  estimates = []
   for frame in frames:
     controller.front_radar_measurement_delay_s = max(
       0.0, float(frame.radar_delay_s),
@@ -2305,7 +2594,207 @@ def _production_controller_outputs(
       frame.yaw_rate_rad_s,
       frame.input_age_s - frame.model_age_s,
     ))
-  return tuple(outputs)
+    estimates.append(controller.trajectory_cutin.last_estimates)
+  return tuple(outputs), tuple(estimates)
+
+
+def _production_controller_outputs(
+  frames: Sequence[RadarFrame],
+  *,
+  motion_sensor: str,
+  enable_radar_tracks: int,
+  cut_in_sensitivity: int,
+) -> tuple[Any, ...]:
+  return _production_controller_replay(
+    frames,
+    motion_sensor=motion_sensor,
+    enable_radar_tracks=enable_radar_tracks,
+    cut_in_sensitivity=cut_in_sensitivity,
+  )[0]
+
+
+class ProductionDPathSelector:
+  """Replay only the production controller without rebuilding shadow models."""
+
+  name = "production-dpath-controller"
+
+  def __init__(
+    self,
+    frames: Sequence[RadarFrame],
+    *,
+    motion_sensor: str | None = None,
+    enable_radar_tracks: int = 2,
+    cut_in_sensitivity: int = VALIDATION_DEFAULT_SENSITIVITY,
+  ) -> None:
+    self.motion_sensor = motion_sensor or preferred_radar_motion_sensor(frames)
+    self.enable_radar_tracks = int(enable_radar_tracks)
+    self.cut_in_sensitivity = max(0, min(5, int(cut_in_sensitivity)))
+    self.motion_sensitivity = radar_motion_sensitivity(
+      self.cut_in_sensitivity,
+      self.motion_sensor,
+    )
+    self.decision_threshold = self.motion_sensitivity.cut_in_threshold
+    outputs, estimate_series = _production_controller_replay(
+      frames,
+      motion_sensor=self.motion_sensor,
+      enable_radar_tracks=self.enable_radar_tracks,
+      cut_in_sensitivity=self.cut_in_sensitivity,
+    )
+    selections = []
+    for frame, output, estimates in zip(
+      frames, outputs, estimate_series, strict=True,
+    ):
+      estimate_aliases: dict[int, tuple[int, ...]] = {}
+      for estimate in estimates:
+        if estimate.cross_sensor_track_id is None:
+          continue
+        point_id = estimate.point.track_id
+        cross_id = estimate.cross_sensor_track_id
+        estimate_aliases[point_id] = tuple({
+          *estimate_aliases.get(point_id, ()), cross_id,
+        })
+        estimate_aliases[cross_id] = tuple({
+          *estimate_aliases.get(cross_id, ()), point_id,
+        })
+      lead_one = _controller_candidate(
+        frame, output.lead_one, "production dPath leadOne",
+      )
+      lead_two = _controller_candidate(
+        frame,
+        output.lead_two,
+        "production dPath leadTwo",
+        track_aliases=estimate_aliases.get(
+          int((output.lead_two or {}).get("radarTrackId", -1)), (),
+        ),
+      )
+      decisions = tuple(
+        candidate
+        for lead in output.leads_cutin
+        if (
+          candidate := _controller_candidate(
+            frame,
+            lead,
+            "trajectory CUT-IN",
+            track_aliases=estimate_aliases.get(
+              int(lead.get("radarTrackId", -1)), (),
+            ),
+          )
+        ) is not None
+      )
+      risk = _controller_candidate(
+        frame,
+        output.lead_cutin_risk,
+        "trajectory CUT-IN pre-deceleration",
+        track_aliases=estimate_aliases.get(
+          int((output.lead_cutin_risk or {}).get("radarTrackId", -1)), (),
+        ),
+      )
+      diagnostics = tuple(
+        Candidate(
+          track_id=estimate.point.track_id,
+          score=estimate.confidence,
+          reason=estimate.reason,
+          d_rel=estimate.point.d_rel,
+          y_rel=estimate.point.y_rel,
+          v_lead=estimate.point.v_lead,
+          current_path_occupancy=estimate.current_path,
+          stage=(
+            "CUT-IN" if estimate.confirmed_cutin
+            else "RAW-CUTIN" if estimate.raw_cutin
+            else "PREDECEL" if estimate.predecel_risk
+            else "REAR-PASS" if estimate.rear_pass
+            else "SIDE-DRIFT" if estimate.parallel_drift
+            else "FILTERED" if not estimate.close_front_supported
+            else "JITTER" if estimate.jittering
+            else "TRACK"
+          ),
+          detail=(
+            f"dRel={estimate.point.d_rel:.2f} "
+            + f"vRel={estimate.point.v_rel:.2f} "
+            + f"yRel={estimate.point.y_rel:.2f} "
+            + f"dPath={estimate.d_path:.2f}->{estimate.future_d_path:.2f} "
+            + "| "
+            + f"h={estimate.history_s:.2f} "
+            + f"p={estimate.inward_progress:.2f} "
+            + f"dir={estimate.direction_consistency:.2f} "
+            + f"yaw={estimate.recent_abs_yaw_max:.3f} "
+            + f"vSp={estimate.recent_v_rel_spread:.2f} "
+            + f"rp={estimate.recent_inward_progress:.2f} "
+            + f"rd={estimate.recent_direction_consistency:.2f} "
+            + "| "
+            + f"J={int(estimate.jittering)} "
+            + f"FJ={int(estimate.unstable_fast_motion)} "
+            + f"rearPass={int(estimate.rear_pass)} "
+            + f"sideDrift={int(estimate.parallel_drift)} "
+            + f"close={int(estimate.close_front_supported)} "
+            + f"hist={int(estimate.front_history_supported)} "
+            + f"vision={int(estimate.vision_supported)} "
+            + f"cross={int(estimate.cross_sensor_supported)} "
+            + f"ctrl={int(estimate.control_eligible)} "
+            + f"H={estimate.horizon_s:.2f} "
+            + f"rate={estimate.inward_rate:.2f} "
+            + f"radar={estimate.reported_inward_rate:.2f} "
+            + f"move={estimate.lateral_travel:.2f} "
+            + f"net={estimate.lateral_net_fraction:.2f} "
+            + f"vMin={estimate.recent_v_rel_min:.2f} "
+            + "crossId="
+            + (
+              "--" if estimate.cross_sensor_track_id is None
+              else str(estimate.cross_sensor_track_id)
+            )
+            + " "
+            + f"curve={int(estimate.curve_alias)} "
+            + "eta="
+            + (
+              "--" if estimate.time_to_overlap_s is None
+              else f"{estimate.time_to_overlap_s:.2f}s"
+            )
+          ),
+          source=estimate.point.source,
+          continuity_id=estimate.continuity_id,
+        )
+        for estimate in estimates
+      )
+      selections.append(Selection(
+        lead_one=lead_one,
+        lead_two=lead_two,
+        front_candidates=tuple(
+          candidate for candidate in diagnostics
+          if not candidate.source.startswith("corner")
+        ),
+        corner_candidates=tuple(
+          candidate for candidate in diagnostics
+          if candidate.source.startswith("corner")
+        ),
+        cutin_diagnostics=diagnostics,
+        decision_cutin_candidates=decisions,
+        active_cutin_candidates=decisions,
+        external_candidates=decisions,
+        active_external_candidates=decisions,
+        cutin_predecel_candidate=risk,
+      ))
+    self.motion_points = tuple(
+      motion_points_at_model_time(frame, self.motion_sensor)
+      for frame in frames
+    )
+    # Legacy trajectories use a different predictor and must not be drawn over
+    # production decisions. Production state remains in the track diagnostics.
+    self.trajectories: tuple[dict[Any, Any], ...] = tuple(
+      {} for _ in frames
+    )
+    self.lead_one_outputs = tuple(output.lead_one for output in outputs)
+    self.outputs = outputs
+    self.selections = tuple(selections)
+
+  def select(
+    self,
+    frame: RadarFrame,
+    frame_index: int | None = None,
+  ) -> Selection:
+    del frame
+    if frame_index is None:
+      raise ValueError("production dPath selector requires a frame index")
+    return self.selections[frame_index]
 
 
 def _empty_recorded_lead() -> RecordedLead:
@@ -3177,7 +3666,7 @@ def print_summary(
 
 
 class SimulatorUI:
-  """Replay screen showing only the physical dPath predictor."""
+  """Replay production dPath decisions with cached legacy comparisons."""
 
   def __init__(
     self,
@@ -3194,19 +3683,30 @@ class SimulatorUI:
     cut_in_sensitivity: int | None = None,
     sensor_probabilities: dict[str, float] | None = None,
     sensor_lookaheads: dict[str, float] | None = None,
+    v3_selector: RadarOccupancyV3Selector | None = None,
+    production_selector: ProductionDPathSelector | None = None,
   ) -> None:
     import pyray as rl
     self.rl = rl
     self.frames = frames
-    self.selector = selector
-    self.use_occupancy_v2 = isinstance(selector, RadarOccupancyV2Selector)
+    self.production_selector = production_selector
+    self.selector = production_selector or selector
+    self.occupancy_version = (
+      4
+      if production_selector is not None
+      else 2 if isinstance(selector, RadarOccupancyV2Selector) else 1
+    )
+    self.use_occupancy_v2 = self.occupancy_version == 2
     self.v1_selector = (
-      selector.baseline if self.use_occupancy_v2 else selector
+      selector.baseline
+      if isinstance(selector, RadarOccupancyV2Selector)
+      else selector
     )
     self.v2_selector = (
-      selector if self.use_occupancy_v2 else None
+      selector if isinstance(selector, RadarOccupancyV2Selector) else None
     )
-    self.enable_radar_tracks = selector.enable_radar_tracks
+    self.v3_selector = v3_selector
+    self.enable_radar_tracks = self.selector.enable_radar_tracks
     self.title = title
     self.log_path = log_path
     self.reviews = reviews
@@ -3216,7 +3716,7 @@ class SimulatorUI:
       raise ValueError(f"unsupported radar motion mode: {motion_mode}")
     self.motion_mode = motion_mode
     self.cut_in_sensitivity = (
-      selector.cut_in_sensitivity
+      self.selector.cut_in_sensitivity
       if cut_in_sensitivity is None
       else max(0, min(5, int(cut_in_sensitivity)))
     )
@@ -3238,11 +3738,11 @@ class SimulatorUI:
       }
     )
     applied_threshold = (
-      selector.decision_threshold
+      self.selector.decision_threshold
       if display_threshold is None
       else float(display_threshold)
     )
-    self.sensor_probabilities[selector.motion_sensor] = applied_threshold
+    self.sensor_probabilities[self.selector.motion_sensor] = applied_threshold
     self.display_threshold = applied_threshold
     self.pending_probability = applied_threshold
     self.probability_dragging = False
@@ -3257,10 +3757,10 @@ class SimulatorUI:
       ): self.v1_selector,
     }
     self.sensor_history_cache = {
-      selector.motion_sensor: (
-        selector.motion_points,
-        selector.trajectories,
-        selector.lead_one_outputs,
+      self.v1_selector.motion_sensor: (
+        self.v1_selector.motion_points,
+        self.v1_selector.trajectories,
+        self.v1_selector.lead_one_outputs,
       ),
     }
     self.index = 0
@@ -3270,14 +3770,14 @@ class SimulatorUI:
     self.playback_time = 0.0
     self.events = trajectory_model_review_events(
       frames,
-      selector,
+      self.selector,
       ("front+corner",),
       applied_threshold,
     )
     self._refresh_lead_continuity()
     self.handled_events: set[int] = set()
     self.status = (
-      f"dPath 물리 predictor 전용: {selector.motion_sensor} 레이더 · "
+      f"dPath predictor 적용: {self.selector.motion_sensor} 레이더 · "
       + f"EnableRadarTracks {self.enable_radar_tracks}"
     )
     self.font: Any | None = None
@@ -3323,23 +3823,60 @@ class SimulatorUI:
       baseline=baseline,
       enable_radar_tracks=self.enable_radar_tracks,
     )
-    self._activate_sensitivity(
-      value,
-      self.v2_selector if self.use_occupancy_v2 else self.v1_selector,
-    )
+    if self.v3_selector is not None or self.occupancy_version == 3:
+      self.v3_selector = RadarOccupancyV3Selector(
+        self.frames,
+        baseline=self.v1_selector,
+        v2_selector=self.v2_selector,
+        enable_radar_tracks=self.enable_radar_tracks,
+        cut_in_sensitivity=value,
+      )
+    if self.occupancy_version != 4:
+      targets = {
+        1: self.v1_selector,
+        2: self.v2_selector,
+        3: self.v3_selector,
+      }
+      target = targets[self.occupancy_version]
+      assert target is not None
+      self._activate_sensitivity(value, target)
 
   def _toggle_occupancy_version(self) -> None:
-    self.use_occupancy_v2 = not self.use_occupancy_v2
-    if self.use_occupancy_v2 and self.v2_selector is None:
+    version_cycle = (
+      {4: 1, 1: 2, 2: 3, 3: 4}
+      if self.production_selector is not None
+      else {1: 2, 2: 3, 3: 1}
+    )
+    self.occupancy_version = version_cycle[self.occupancy_version]
+    self.use_occupancy_v2 = self.occupancy_version == 2
+    if self.occupancy_version == 2 and self.v2_selector is None:
       self.v2_selector = RadarOccupancyV2Selector(
         self.frames,
         baseline=self.v1_selector,
         enable_radar_tracks=self.enable_radar_tracks,
       )
-    target = self.v2_selector if self.use_occupancy_v2 else self.v1_selector
+    if self.occupancy_version == 3 and self.v3_selector is None:
+      self.v3_selector = RadarOccupancyV3Selector(
+        self.frames,
+        baseline=self.v1_selector,
+        v2_selector=self.v2_selector,
+        enable_radar_tracks=self.enable_radar_tracks,
+        cut_in_sensitivity=self.cut_in_sensitivity,
+      )
+    target = {
+      1: self.v1_selector,
+      2: self.v2_selector,
+      3: self.v3_selector,
+      4: self.production_selector,
+    }[self.occupancy_version]
     assert target is not None
     self._activate_sensitivity(self.cut_in_sensitivity, target)
-    version = "V2 확률 점유" if self.use_occupancy_v2 else "V1 기존"
+    version = {
+      1: "이전 V1",
+      2: "이전 V2 확률 점유",
+      3: "이전 V3 단계 융합",
+      4: "현재 Trajectory (production)",
+    }[self.occupancy_version]
     self.status = f"검증 모델 {version}로 전환"
 
   def _refresh_lead_continuity(self) -> None:
@@ -3381,7 +3918,12 @@ class SimulatorUI:
   def _activate_sensitivity(
     self,
     value: int,
-    selector: RadarMotionShadowSelector | RadarOccupancyV2Selector,
+    selector: (
+      RadarMotionShadowSelector
+      | RadarOccupancyV2Selector
+      | RadarOccupancyV3Selector
+      | ProductionDPathSelector
+    ),
   ) -> None:
     self.selector = selector
     self.cut_in_sensitivity = value
@@ -3464,6 +4006,15 @@ class SimulatorUI:
       ) >= 0.005
     ):
       self._activate_selector_pair(value, cached)
+      if self.production_selector is not None:
+        self.production_selector = ProductionDPathSelector(
+          self.frames,
+          motion_sensor=sensor,
+          enable_radar_tracks=self.enable_radar_tracks,
+          cut_in_sensitivity=value,
+        )
+        if self.occupancy_version == 4:
+          self._activate_sensitivity(value, self.production_selector)
     else:
       label = VALIDATION_SENSITIVITY_LABELS[value]
       self.status = f"CUT-IN 감도 {value} {label} 이미 적용됨"
@@ -3509,9 +4060,21 @@ class SimulatorUI:
     except OSError as exc:
       save_error = exc
     self._activate_selector_pair(self.cut_in_sensitivity, cached)
+    if self.production_selector is not None:
+      self.production_selector = ProductionDPathSelector(
+        self.frames,
+        motion_sensor=target_sensor,
+        enable_radar_tracks=self.enable_radar_tracks,
+        cut_in_sensitivity=self.cut_in_sensitivity,
+      )
+      if self.occupancy_version == 4:
+        self._activate_sensitivity(
+          self.cut_in_sensitivity,
+          self.production_selector,
+        )
     mode_text = "일반(코너 우선)" if mode == "normal" else "프런트 전용"
     self.status = (
-      f"{mode_text} 모드 적용 · {target_sensor} · 미래 5.0초 고정"
+      f"{mode_text} 모드 적용 · {target_sensor} · production 포함 재계산"
     )
     if save_error is not None:
       self.status += f" · 저장 실패: {save_error}"
@@ -4059,8 +4622,13 @@ class SimulatorUI:
       14,
       self._color((145, 158, 170)),
     )
+    trajectory_text = (
+      "현재 production: 우측 진단의 dPath 현재→미래 / rate / direction 확인"
+      if self.occupancy_version == 4
+      else "이전 모델 과거: S,dPath 실선 | 미래: 회색 / 녹색 IN / 주황 CUT-IN"
+    )
     self._draw_text(
-      "과거: S,dPath 실선 | 미래: 회색 부적격 / 녹색 제어가능 IN / 주황 CUT-IN",
+      trajectory_text,
       int(rect.x + 12.0),
       int(rect.y + 46.0),
       14,
@@ -4106,7 +4674,7 @@ class SimulatorUI:
     self._draw_text(
       f"{sensor_text} CUT-IN 감도 {self.pending_sensitivity} "
       + f"{sensitivity_text} · {confirmation_text}"
-      + " · 미래 5.0초 고정"
+      + " · production 재계산"
       + f"  {applied_text}",
       int(slider.x),
       int(slider.y - 27.0),
@@ -4479,7 +5047,12 @@ class SimulatorUI:
       if self.motion_mode == "normal"
       else "프런트 전용"
     )
-    version_text = "V2 확률 점유" if self.use_occupancy_v2 else "V1 기존"
+    version_text = {
+      1: "이전 V1",
+      2: "이전 V2 확률 점유",
+      3: "이전 V3 단계 융합",
+      4: "현재 Trajectory (production)",
+    }[self.occupancy_version]
     self._draw_text(
       f"dPath predictor: {version_text} · {mode_text} · "
       + f"{sensor_text} 레이더 사용 · "
@@ -4514,7 +5087,7 @@ class SimulatorUI:
     )
     self._draw_probability_slider(rect)
     y = rect.y + 194.0
-    max_rows = max(3, int((rect.height - 348.0) // 45.0))
+    max_rows = max(3, int((rect.height - 348.0) // 79.0))
     predecel = selection.cutin_predecel_candidate
     if predecel is not None:
       self._draw_text(
@@ -4525,13 +5098,20 @@ class SimulatorUI:
         15,
         self._color((70, 190, 220)),
       )
-      self._draw_text(predecel.detail[:59], x + 18, int(y + 20.0), 14, muted)
-      y += 45.0
+      detail_lines = predecel.detail.split(" | ", 2)
+      self._draw_text(detail_lines[0][:59], x + 18, int(y + 20.0), 14, muted)
+      if len(detail_lines) > 1:
+        self._draw_text(detail_lines[1][:59], x + 18, int(y + 38.0), 14, muted)
+      if len(detail_lines) > 2:
+        self._draw_text(detail_lines[2][:59], x + 18, int(y + 56.0), 14, muted)
+      y += 79.0
       max_rows -= 1
     for candidate in selection.cutin_diagnostics[:max_rows]:
       stage_text = {
         "CLEAR": "관찰 해제",
         "WATCH": "진입 관찰",
+        "CAUTION": "진입 주의",
+        "PREDECEL": "가속 금지/예비감속",
         "LIMIT": "가속 제한/예비감속",
         "LEAD": "L2 승격",
         "OCCUPIED": "현재 경로 점유",
@@ -4553,8 +5133,13 @@ class SimulatorUI:
         15,
         white,
       )
-      self._draw_text(candidate.detail[:59], x + 18, int(y + 20.0), 14, muted)
-      y += 45.0
+      detail_lines = candidate.detail.split(" | ", 2)
+      self._draw_text(detail_lines[0][:59], x + 18, int(y + 20.0), 14, muted)
+      if len(detail_lines) > 1:
+        self._draw_text(detail_lines[1][:59], x + 18, int(y + 38.0), 14, muted)
+      if len(detail_lines) > 2:
+        self._draw_text(detail_lines[2][:59], x + 18, int(y + 56.0), 14, muted)
+      y += 79.0
     if self.reviews:
       active_reviews = [
         review for review in self.reviews
@@ -4572,7 +5157,7 @@ class SimulatorUI:
       )
     self._draw_text(self.status[:65], x, int(rect.y + rect.height - 83.0), 15, white)
     self._draw_text(
-      "Space 재생  클릭 탐색  R 처음  V V1/V2  T 처리모드  F 표시  H 궤적  A raw  M 마커",
+      "Space 재생  클릭 탐색  R 처음  V 현재/이전 비교  T 처리모드  F 표시  H 궤적  A raw  M 마커",
       x,
       int(rect.y + rect.height - 51.0),
       13,
@@ -5052,8 +5637,8 @@ def parse_args() -> argparse.Namespace:
     type=float,
     default=None,
     help=(
-      "advanced one-run probability threshold override; the UI no longer "
-      + "changes this sensor-specific safety threshold"
+      "legacy V1/V2/V3 comparison threshold override; production behavior "
+      + "is controlled only by CUT-IN sensitivity"
     ),
   )
   parser.add_argument(
@@ -5078,7 +5663,7 @@ def parse_args() -> argparse.Namespace:
   parser.add_argument(
     "--legacy-v1",
     action="store_true",
-    help="start visual review with the legacy V1 detector (V toggles V1/V2)",
+    help="start legacy-only visual review with V1 (V cycles old V1/V2/V3)",
   )
   parser.add_argument("--validation-case", action="append", default=[])
   parser.add_argument(
@@ -5166,7 +5751,7 @@ def main() -> int:
     else None
   )
   if cached is not None:
-    frames, v2_selector = cached
+    frames, v2_selector, v3_selector, production_selector = cached
     v1_selector = v2_selector.baseline
     motion_sensor = v1_selector.motion_sensor
     probability = v1_selector.decision_threshold
@@ -5203,8 +5788,27 @@ def main() -> int:
       baseline=v1_selector,
       enable_radar_tracks=args.enable_radar_tracks,
     )
+    v3_selector = RadarOccupancyV3Selector(
+      frames,
+      baseline=v1_selector,
+      v2_selector=v2_selector,
+      enable_radar_tracks=args.enable_radar_tracks,
+      cut_in_sensitivity=cut_in_sensitivity,
+    )
+    production_selector = ProductionDPathSelector(
+      frames,
+      motion_sensor=motion_sensor,
+      enable_radar_tracks=args.enable_radar_tracks,
+      cut_in_sensitivity=cut_in_sensitivity,
+    )
     if args.preload_only and cache_path is not None:
-      save_visual_replay_cache(cache_path, frames, v2_selector)
+      save_visual_replay_cache(
+        cache_path,
+        frames,
+        v2_selector,
+        v3_selector,
+        production_selector,
+      )
   motion_policy = radar_motion_sensitivity(
     cut_in_sensitivity,
     motion_sensor,
@@ -5219,24 +5823,28 @@ def main() -> int:
       f"Front-only replay: ignoring {ignored} measured corner-radar points.",
       flush=True,
     )
-  print(
-    f"Validation {motion_sensor} CUT-IN: sensitivity "
-    + f"{cut_in_sensitivity} "
-    + f"({VALIDATION_SENSITIVITY_LABELS[cut_in_sensitivity]}), "
-    + f"probability {probability:.2f}, confirmation "
-    + f"{motion_policy.confirmation_s:.2f}s, future lookahead 5.0s, "
-    + "continuous overlap "
-    + f">={VALIDATION_MIN_CONTINUOUS_OVERLAP_S:.1f}s",
-    flush=True,
-  )
-  selector = (
-    v1_selector
-    if args.legacy_v1
-    else v2_selector
-  )
+  if args.legacy_v1:
+    print(
+      f"Legacy validation {motion_sensor} CUT-IN: sensitivity "
+      + f"{cut_in_sensitivity} "
+      + f"({VALIDATION_SENSITIVITY_LABELS[cut_in_sensitivity]}), "
+      + f"probability {probability:.2f}, confirmation "
+      + f"{motion_policy.confirmation_s:.2f}s, future lookahead 5.0s, "
+      + "continuous overlap "
+      + f">={VALIDATION_MIN_CONTINUOUS_OVERLAP_S:.1f}s",
+      flush=True,
+    )
+  else:
+    print(
+      f"Production Trajectory CUT-IN: sensitivity {cut_in_sensitivity} "
+      + f"({VALIDATION_SENSITIVITY_LABELS[cut_in_sensitivity]}), "
+      + f"{motion_sensor} preferred, full dPath controller replay",
+      flush=True,
+    )
   if args.preload_only:
     print(f"Prepared replay cache for {args.rlog}", flush=True)
     return 0
+  selector = v1_selector if args.legacy_v1 else production_selector
   print_summary(args.rlog, frames, selector)
   if args.summary:
     return 0
@@ -5244,14 +5852,16 @@ def main() -> int:
   display_name = f"{position}{args.rlog.parent.name}/{args.rlog.name}"
   ui = SimulatorUI(
     frames,
-    selector,
+    v1_selector if args.legacy_v1 else v2_selector,
     display_name,
     args.rlog,
     reviews=reviews,
     validation_cases_path=args.validation_cases if reviews else None,
-    display_threshold=probability,
+    display_threshold=selector.decision_threshold,
     motion_mode=motion_mode,
     cut_in_sensitivity=cut_in_sensitivity,
+    v3_selector=v3_selector,
+    production_selector=None if args.legacy_v1 else production_selector,
   )
   if args.legacy_v1:
     ui.v2_selector = v2_selector
@@ -5265,9 +5875,11 @@ __all__ = (
   "CurrentRadardTeacher",
   "LeadSelector",
   "ModelLead",
+  "ProductionDPathSelector",
   "RadarFrame",
   "RadarMotionShadowSelector",
   "RadarOccupancyV2Selector",
+  "RadarOccupancyV3Selector",
   "RadarPoint",
   "RecordedLead",
   "Selection",
