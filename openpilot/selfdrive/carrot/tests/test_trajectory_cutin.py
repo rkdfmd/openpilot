@@ -526,6 +526,34 @@ def test_entry_withdrawal_requires_sustained_motion_loss_outside_path(side, mane
     assert not any(e.entry_withdrawn for e in estimates)
 
 
+@pytest.mark.parametrize("side", (-1.0, 1.0))
+@pytest.mark.parametrize("aborts_entry", (False, True))
+def test_confirmed_slow_entry_does_not_flip_parallel_at_velocity_boundary(side, aborts_entry) -> None:
+  detector = TrajectoryCutInDetector()
+  estimates = []
+  for index in range(41):
+    time_s = index * 0.05
+    stopped = aborts_entry and time_s >= 1.0
+    lateral = 2.55 - 0.30 * (min(time_s, 1.0) if aborts_entry else time_s)
+    # The 0.9 s progress window remains around 0.25 m, and reported velocity
+    # jitters across 0.15 m/s although positions keep moving inward.
+    reported = 0.0 if stopped else 0.14 if index >= 20 and index % 2 else 0.16
+    corner = point(1200, "corner180", 3.0 + 0.1 * time_s, side * lateral,
+                   v_ego=3.0, v_rel=0.1, yv_rel=-side * reported)
+    front = point(40, "frontRadar", corner.d_rel + 1.0, corner.y_rel,
+                  v_ego=3.0, v_rel=0.1, yv_rel=-side * reported)
+    estimates.append(detector.update(time_s, 3.0, (corner,), PATH, MODEL,
+      cross_sensor_matches={(corner.source, corner.track_id): front})[0])
+
+  first = next(i for i, estimate in enumerate(estimates) if estimate.confirmed_cutin)
+  assert first < 20
+  if aborts_entry:
+    assert any(e.entry_withdrawn for e in estimates[20:])
+    assert all(not e.confirmed_cutin for e in estimates[30:])
+  else:
+    assert all(e.confirmed_cutin and not e.parallel_drift for e in estimates[first:])
+
+
 def test_far_inconsistent_corner_motion_stays_alert_only() -> None:
   detector = TrajectoryCutInDetector()
   estimate = None
@@ -1298,6 +1326,75 @@ def test_alternating_corner_jitter_is_rejected() -> None:
   )
 
   assert estimate.jittering
+  assert not estimate.confirmed_cutin
+
+
+@pytest.mark.parametrize("side", (-1.0, 1.0))
+@pytest.mark.parametrize("missing", (None, "vision", "weak_vision", "front", "front_motion", "corner_motion", "curve", "discontinuity"))
+def test_slow_body_entry_survives_path_jitter_only_with_independent_evidence(side, missing) -> None:
+  detector = TrajectoryCutInDetector()
+  for index in range(71):
+    t = index * 0.05
+    d_rel = 8.0 - t
+    y_rel = side * (2.4 - 0.3 * t)
+    yaw = side * 0.03 if missing == "curve" else 0.0
+    corner = point(1200, "corner180", d_rel, y_rel, v_ego=4.0, v_rel=-1.0,
+                   yv_rel=-yaw * d_rel if missing in ("corner_motion", "curve") else -side * 0.3)
+    front = point(52, "frontRadar", d_rel + 1.0, y_rel - side * 0.2, v_ego=4.0, v_rel=-1.0,
+                  yv_rel=-yaw * (d_rel + 1.0) if missing in ("front_motion", "curve") else -side * 0.3)
+    model = SimpleNamespace(leadsV3=(SimpleNamespace(
+      prob=0.5 if missing == "weak_vision" else 0.99,
+      x=(front.d_rel + 1.0 + 1.52,), y=(0.0,), v=(3.0,),
+    ),))
+    offset = 0.08 if index % 2 else -0.08
+    path = ((0.0, offset), (100.0, offset))
+    if missing == "discontinuity" and index == 70:
+      t += 0.3
+    estimate = detector.update(
+      t, 4.0, (corner,), path, MODEL if missing == "vision" else model,
+      yaw_rate_rad_s=yaw, primary_lead={"status": True, "dRel": 16.0},
+      cross_sensor_matches={} if missing == "front" else {(corner.source, corner.track_id): front},
+    )[0]
+  if missing is None:
+    # Both sensors have been inside the boundary for more than the ordinary
+    # 1.5 s window. Their smooth raw positions resolve the moving path noise.
+    assert estimate.jittering
+    assert estimate.confirmed_cutin
+    assert estimate.paired_body_entry
+    assert estimate.control_eligible
+  else:
+    assert not estimate.paired_body_entry
+    assert not estimate.confirmed_cutin
+
+
+@pytest.mark.parametrize("missing", ("outside", "stale_outside", "parallel", "front_jitter", "range", "speed", "new_front", "unmeasured_front", "scc"))
+def test_slow_body_entry_cannot_use_stale_history_or_unrelated_vision(missing) -> None:
+  detector = TrajectoryCutInDetector()
+  for index in range(131):
+    t = index * 0.05
+    # The stale case spends >3 s inside before a second small inward move.
+    if missing == "outside":
+      y = 1.85 - 0.08 * t
+    elif missing == "stale_outside":
+      y = max(1.7, 2.4 - 0.7 * t) - max(0.0, t - 5.0) * 0.3
+    else:
+      y = max(1.8, 2.4 - 0.3 * t) - max(0.0, t - 5.0) * (0.0 if missing == "parallel" else 0.3)
+    corner = point(1200, "corner180", 7.0, y, v_ego=4.0, v_rel=-0.2, yv_rel=-0.3)
+    front = point(52, "frontRadar", 8.0, y - 0.2 + (0.2 * (-1)**index if missing == "front_jitter" else 0.0),
+                  v_ego=4.0, v_rel=-0.2, yv_rel=-0.3)
+    if missing in ("new_front", "unmeasured_front", "scc"):
+      from dataclasses import replace
+      front = replace(front, track_id=52 + index if missing == "new_front" else 52,
+                      measured=missing != "unmeasured_front", source="scc" if missing == "scc" else "frontRadar")
+    model = SimpleNamespace(leadsV3=(SimpleNamespace(
+      prob=0.99, x=(25.0 if missing == "range" else 10.52,),
+      y=(0.0,), v=(15.0 if missing == "speed" else 3.8,),
+    ),))
+    offset = 0.08 if index % 2 else -0.08
+    estimate = detector.update(t, 4.0, (corner,), ((0.0, offset), (100.0, offset)), model,
+                               primary_lead={"status": True, "dRel": 16.0},
+                               cross_sensor_matches={(corner.source, corner.track_id): front})[0]
+  assert not estimate.paired_body_entry
   assert not estimate.confirmed_cutin
 
 

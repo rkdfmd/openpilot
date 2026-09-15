@@ -231,6 +231,10 @@ class LongitudinalPlanner:
       jerk_factor=carrot.jerk_factor,
       a_change_cost_starting=carrot.aChangeCostStarting,
       lead_accel_response_enabled=lead_accel_response_enabled,
+      lead_gap_enabled=(
+        not reset_state and not sm['carState'].gasPressed
+        and not force_slow_decel and not carrot.lane_change_active
+      ),
       cutout_relief_enabled=(
         not reset_state and not sm['carState'].gasPressed
         and not force_slow_decel and not self.output_should_stop
@@ -279,12 +283,16 @@ class LongitudinalPlanner:
     lead_index = 1 if self.mpc.source == 'lead1' else 0
     leads = (sm['radarState'].leadOne, sm['radarState'].leadTwo)
     lead = leads[lead_index]
+    preview_enabled = (
+      self.mpc.mode == 'acc'
+      and not reset_state
+      and not sm['carState'].gasPressed
+      and not sm['carState'].brakePressed
+    )
     preview_request = get_lead_preview_request(
       carrot.myDrivingMode,
       lead_status=(
-        self.mpc.mode == 'acc'
-        and not reset_state
-        and not sm['carState'].gasPressed
+        preview_enabled
         and lead.status
         and lead.radar
         and lead.radarTrackId >= 0
@@ -292,7 +300,10 @@ class LongitudinalPlanner:
       a_lead=lead.aLeadK,
       a_ego=sm['carState'].aEgo,
     )
-    if preview_request.active:
+    if preview_enabled:
+      # Losing radar support stops requesting preview; it must not erase an
+      # existing braking correction in one frame. Release on the current MPC
+      # trajectory, without retaining the old lead or delaying new braking.
       requested_preview = rate_limit_preview(
         preview_request.offset_s,
         self.lead_preview,
@@ -316,8 +327,7 @@ class LongitudinalPlanner:
       output_a_target_base,
       output_a_target_preview,
       carrot.myDrivingMode,
-      self.lead_preview_accel,
-    ) if preview_request.active else output_a_target_base
+    ) if preview_enabled else output_a_target_base
     output_a_target_e2e = sm['modelV2'].action.desiredAcceleration
     output_should_stop_e2e = sm['modelV2'].action.shouldStop
     output_v_target_now_e2e = sm['modelV2'].action.desiredVelocity
