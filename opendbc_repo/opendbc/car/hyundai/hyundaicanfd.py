@@ -5,6 +5,7 @@ from opendbc.car import CanBusBase, DT_CTRL
 from opendbc.car.carlog import carlog
 from opendbc.car.crc import CRC16_XMODEM
 from opendbc.car.hyundai.values import HyundaiFlags, HyundaiExtFlags
+from opendbc.car.hyundai.stopping import MOVING_SPEED
 from openpilot.common.params import Params
 from openpilot.common.filter_simple import FirstOrderFilter
 from opendbc.car.common.conversions import Conversions as CV
@@ -29,7 +30,7 @@ def apply_accel_jerk_limit(a_raw: float, a_value_last: float, jerk_u: float, jer
   return float(np.clip(a_raw, a_value_last - lower_step, a_value_last + upper_step))
 
 
-def apply_stopping_experiment(values, CS, controller, accel, previous_value, jerk_u, jerk_l):
+def apply_canfd_stopping(values, CS, controller, accel, previous_value, jerk_u, jerk_l):
   """Apply the stopping/re-entry sequence after the normal SCC interlocks."""
   if controller is None:
     return
@@ -38,13 +39,18 @@ def apply_stopping_experiment(values, CS, controller, accel, previous_value, jer
   speeds = [CS.out.vEgo, CS.out.vEgoRaw, wheels.fl, wheels.fr, wheels.rl, wheels.rr]
   finite = all(math.isfinite(v) for v in (*speeds, accel, previous_value, jerk_u, jerk_l))
   speed = max(abs(v) for v in speeds) if finite else 0.0
-  blocked = (not finite or not CS.out.canValid or CS.out.brakePressed or CS.out.gasPressed
+  soft_hold = CS.softHoldActive > 0 and CS.out.cruiseState.available
+  # Only an armed, stationary soft hold may prepare while the driver brakes.
+  # Ordinary braking and pedal input while moving keep their existing interlock.
+  brake_blocked = CS.out.brakePressed and not (soft_hold and speed <= MOVING_SPEED)
+  blocked = (not finite or not CS.out.canValid or brake_blocked or CS.out.gasPressed
              or str(CS.out.gearShifter) != "drive" or longitudinal_interlock_active(CS))
   previous_phase = controller.phase
   command = controller.update(
     active=values["ACCMode"] == 1 and not blocked, requested=bool(values["StopReq"]), speed=speed,
     held=CS.canfdSccHoldActive, accel=accel, previous_value=previous_value,
     jerk_u=max(0.0, min(jerk_u, 5.0)), jerk_l=max(1.0, min(jerk_l, 5.0)),
+    soft_hold=soft_hold,
   )
   if blocked or values["ACCMode"] != 1:
     values.update(StopReq=0, aReqRaw=0.0, aReqValue=0.0)
@@ -58,6 +64,7 @@ def apply_stopping_experiment(values, CS, controller, accel, previous_value, jer
     carlog.warning({"event": "carrot_stopping", "from": str(previous_phase), "phase": str(controller.phase),
                     "reason": controller.reason, "speed": speed, "aEgo": CS.out.aEgo,
                     "held": CS.canfdSccHoldActive, "retry_used": controller.retried,
+                    "soft_hold": soft_hold, "prepare_cycles": controller.prepare_cycles,
                     "StopReq": values["StopReq"], "aReqRaw": values["aReqRaw"], "aReqValue": values["aReqValue"]})
 
 
@@ -451,6 +458,7 @@ def create_acc_control_scc2(packer, CAN, enabled, accel_value_last, accel, stopp
   enabled = acc_control_enabled
 
   acc_mode = 0 if not enabled else (2 if gas_override else 1)
+  previous_value = accel_value_last
 
   if hyundai_jerk.carrot_cruise == 1:
     acc_mode = 4 if enabled else 0
@@ -510,12 +518,12 @@ def create_acc_control_scc2(packer, CAN, enabled, accel_value_last, accel, stopp
   values["AccelLimitBandLower"] = 0.0
 
   values["ZEROS_7"] = 0 if stop_controller is not None else 1
-  apply_stopping_experiment(values, CS, stop_controller, accel, accel_value_last, jerk_u, jerk_l)
+  apply_canfd_stopping(values, CS, stop_controller, accel, previous_value, jerk_u, jerk_l)
 
   return packer.make_can_msg("SCC_CONTROL", CAN.ECAN, values), values["aReqValue"]
 
 def create_acc_control(packer, CAN, enabled, accel_last, accel, stopping, gas_override, set_speed, hud_control, jerk_u, jerk_l, CS,
-                       stop_controller=None):
+                       stop_controller=None, accel_value_last=None):
 
   interlock_active = longitudinal_interlock_active(CS)
   soft_hold_active = CS.softHoldActive > 0 and CS.out.cruiseState.available
@@ -555,8 +563,11 @@ def create_acc_control(packer, CAN, enabled, accel_last, accel, stopping, gas_ov
     "ZEROS_7": 0,
   }
 
-  apply_stopping_experiment(values, CS, stop_controller, accel, accel_last, jerk_u, jerk_l)
-  return packer.make_can_msg("SCC_CONTROL", CAN.ECAN, values)
+  # accel_last is the legacy raw target, not necessarily the previous SCC
+  # output. Keep ordinary packet limiting; anchor stop entry to the returned value.
+  previous_value = accel_last if accel_value_last is None else accel_value_last
+  apply_canfd_stopping(values, CS, stop_controller, accel, previous_value, jerk_u, jerk_l)
+  return packer.make_can_msg("SCC_CONTROL", CAN.ECAN, values), values["aReqValue"]
 
 
 def create_spas_messages(packer, CAN, frame, left_blink, right_blink):
@@ -774,12 +785,18 @@ def _apply_cluster_lane_lines(values, CS, lat_active, desire):
     _apply_lane_desire(values, desire)
 
 
-def _convert_ccnc_boxes_to_cars(values):
-  # Only 0x162 uses 1/2 for gray/white boxes and 3/4 for gray/white cars.
-  # 0x1ea has different display enums; FF_DETECT_ALT has no car enum.
-  for key in ("FF_DETECT", "LF_DETECT", "RF_DETECT", "LR_DETECT", "RR_DETECT"):
-    if values[key] in (1, 2):
-      values[key] += 2
+def _normalize_cluster_corner_objects(values):
+  # Restore the legacy corner display state without blinking or clamping distance.
+  for side in ("LF", "RF", "LR", "RR"):
+    key = f"{side}_DETECT"
+    if values[key] >= 4 and values[f"{side}_DETECT_DISTANCE"] != 0:
+      values[key] = 1
+
+
+def _convert_ccnc_front_box_to_car(values):
+  # Preserve the current front-lead presentation independently of corner objects.
+  if values["FF_DETECT"] in (1, 2):
+    values["FF_DETECT"] += 2
 
 
 def _apply_ccnc_lead(values, radar_state, enabled, model_v2=None, hud_lateral=None):
@@ -989,13 +1006,15 @@ def create_ccnc_messages(CP, packer, CAN, frame, CC, CS, hud_control,
         values['RIGHT_BLINK_HOLD'] = 1 if lane_changing == 4 else 0
 
         _apply_cluster_lane_lines(values, CS, lat_active, desire)
+        _normalize_cluster_corner_objects(values)
 
         ret.append(packer.make_can_msg("ADRV_0x1ea", CAN.ECAN, values, rx_counter = rx_counter))
 
       if CS.ccnc_0x162 is not None:
         values = copy.copy(CS.ccnc_0x162)
 
-        _convert_ccnc_boxes_to_cars(values)
+        _normalize_cluster_corner_objects(values)
+        _convert_ccnc_front_box_to_car(values)
         _apply_ccnc_lead(values, getattr(CS, "radarState", None), CC.enabled, getattr(CS, "modelV2", None), hud_lateral)
 
         if (left_lane_warning and not CS.out.leftBlinker) or (right_lane_warning and not CS.out.rightBlinker):
