@@ -229,6 +229,11 @@ struct CarState {
   # blindspot sensors
   leftBlindspot @33 :Bool; # Is there something blocking the left lane change
   rightBlindspot @34 :Bool; # Is there something blocking the right lane change
+  leftBlindspotOem @95 :Bool; # vehicle BSD-only left source before ONNX merge
+  rightBlindspotOem @96 :Bool; # vehicle BSD-only right source before ONNX merge
+  leftBlindspotOnnx @97 :Bool; # ONNX BSD-only left source
+  rightBlindspotOnnx @98 :Bool; # ONNX BSD-only right source
+  blindspotSplitSourcesValid @99 :Bool; # split blindspot source fields are valid and should be trusted
 
   fuelGauge @41 :Float32; # battery or fuel tank level from 0.0 to 1.0
   charging @43 :Bool;
@@ -503,6 +508,8 @@ struct CarControl {
     naviEventType @19: Int16;   # VW MEB cluster: 0=없음 1=커브 2=교차로 3=분기/출구 4=로터리 5=병목 8=도로제한제어중
     naviEventSpeed @20: Int16;  # VW MEB cluster: 목표속도 kph (커브는 부호=방향: +우/-좌) -> ACC_Event_Wunschgeschw
     leadLimiting @21: Bool;     # VW MEB cluster: 앞차가 속도를 제한 중(xState lead) -> 앞차 하이라이트 우선
+
+    driverMonitoringAlert @22: UInt8;  # 0=none, 1=initial, 2=audible, 3=terminal; fresh enabled DM only
 
     # not used with the dash, TODO: separate structs for dash UI and device UI
     audibleAlert @5: AudibleAlert;
