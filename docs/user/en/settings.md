@@ -2,6 +2,18 @@
 
 [한국어](../ko/settings.md)
 
+With **phone voice** in CarrotAssist 0.2.8, say “Find acceleration settings.” After granting setting access once on the device, say “Set acceleration setting zero to 240.” Direct commands work without ChatGPT or MCP registration. In the same voice session, you can follow a search with “Set the first one to 240”. [Phone voice instructions](carrot-assist.md)
+
+Android [CarrotAssist](carrot-assist.md) uses ChatGPT to find, explain and open settings. Separate device and ChatGPT authorization enables live reads and changes. With relay0.7.3, a clear setting/value or adjustment command applies after bounds checks without another question. For example, “Set acceleration setting 0 to 240” produces a short result after verified storage. Ambiguous requests and AI-recommended values require clarification; out-of-range values are rejected. Supported driving settings follow the same procedure while driving. Only initial authorization requires stationary/disengaged state; each setting keeps its existing activation timing.
+
+ChatGPT action approval is separate from device permission. Users who do not want repeated prompts can choose **ChatGPT Settings → Plugins → CarrotAssist → Permissions → Allow all actions** in their own account. This covers all actions authorized for this plugin; CarrotAssist cannot select it automatically. If old confirmation instructions remain, use **Refresh tools → new conversation**, not a fresh pairing code. To talk while touching the web, start background voice in the full ChatGPT app and return to CarrotAssist using the [documented steps](carrot-assist.md).
+
+Experimental lane-change and cruise set-speed requests within the same voice conversation need separate **Allow voice lane-change and set-speed commands** permission on both sides. Setting access never expands automatically. Settings retain internal current-value/bounds checks and readback; driving commands follow separate execution conditions. See the [continuous voice guide and supported conditions](carrot-assist.md).
+
+In CarrotAssist 0.2.4, drag the orange microphone to keep it in your preferred position. Tap to verify the current Carrot Web account link and online status, then open the default assistant overlay. If verification fails, choose **Check again** or **Open assistant only**. Invoking the assistant directly with the phone’s side key skips the app’s startup check. From 0.2.5 the greeting announces an available device Git update. With updated Carrot Web and Tools access, say “Open Naver Map” to launch the installed phone app. Version 0.2.6 supports direct turn-signal settings and left/right lane requests without ChatGPT registration on phones with on-device speech recognition.
+
+Voice Tools operations require separate **Allow Tools panels and actions** permission. The [CarrotAssist guide](carrot-assist.md) covers backup/restore screens, confirmed GitPull/restart jobs, and separate first-installation and reconnection steps. Paste authorization codes into the device approval webpage, never a voice conversation.
+
 > [!NOTE]
 > This is the canonical English user guide maintained with the `carrot-wip` code. When user-visible behavior changes, update this document together with the related code and tests.
 
@@ -105,32 +117,37 @@ Ignoring `x0.01`, `x0.001`, `cm`, `km/h`, or `%` can make a value appear one hun
 
 ## Settings map
 
-The current `carrot_settings.json` contains **201 parameters**. The driver-monitoring exception and `NNFF` are search only; the remaining entries appear in these menus:
+The current `carrot_settings.json` contains **213 parameters**. The driver-monitoring exception and `NNFF` are search only; the remaining entries appear in these menus:
 
 | Category | Count | Groups |
 |---|---:|---|
-| Driving control | 124 | Startup and auto, buttons and presets, steering, speed and deceleration, cruise and following gap |
-| Vehicle and hardware | 17 | Hyundai/Kia, CAN FD/HDA, radar, driver monitoring, vehicle assistance, device hardware |
+| Driving control | 136 | Startup and auto, Tesla, buttons and presets, steering, speed and deceleration, cruise and following gap |
+| Vehicle and hardware | 18 | Hyundai/Kia, CAN FD/HDA, radar, driver monitoring, vehicle assistance, device hardware |
 | Display | 34 | Information, path, brightness/on-road view, external HUD |
 | System | 12 | Recording/power, network/map, sound, software |
 
 ## Driving control
 
-These 124 settings can affect driving behavior. Change one item at a time.
+These 136 settings can affect driving behavior. Change one item at a time.
 
 <a id="start-auto"></a>
-### Startup and auto — 10 settings
+### Startup and auto — 9 settings; Tesla — 6 settings
 
 | Section | Parameters | Purpose |
 |---|---|---|
-| Startup | `AlwaysLateral`, `TeslaAutoTurnSignals`, `AutoEngage`, `DisableMinSteerSpeed` | Always-on lateral control, Tesla lamps, automatic engagement, and low-speed steering limits |
+| Startup | `AlwaysLateral`, `AutoEngage`, `DisableMinSteerSpeed` | Always-on lateral control, automatic engagement, and low-speed steering limits |
+| Driving > Tesla > Tesla Features | `TeslaAutoTurnSignals`, `TeslaCanTrafficStop`, `TeslaManualLaneSignals`, `TeslaModelDesireSignals`, `TeslaModelPathSignals`, `TeslaAutoSpeedLimit` | Six independent default-OFF switches; restart required |
 | Auto cruise | `AutoCruiseControl`, `AutoGasTokSpeed`, `AutoGasCancelSpeed`, `AutoGasSyncSpeed`, `CruiseOnDist` | Automatic cruise activation and accelerator-pedal behavior |
 
-- `AlwaysLateral` permits lateral control even when cruise is not engaged. On supported Tesla vehicles it can also steer at true standstill in a forward-driving gear; moving below the minimum steering speed remains restricted. See [Tesla engagement](tesla.md#engagement-and-standstill).
+- `AlwaysLateral` permits lateral control even when cruise is not engaged. Tesla's three-finger screen contact toggles it live instead of Experimental Mode; OFF does not disengage steering under active driving control. On supported Tesla vehicles it can also steer at true standstill in a forward-driving gear; moving below the minimum steering speed remains restricted. See [Tesla engagement](tesla.md#engagement-and-standstill).
+- Confirmed persistent CAN-controller errors or recurring Casper front-safety-system faults trigger an alert and disable always-on steering too; re-engagement is blocked until the fault clears.
 - Always Lateral waits for the first confirmation of valid model, vehicle-parameter, pose, and other required inputs after system startup. Once confirmed, this startup check ends; later input interruptions or disengagement/reengagement do not rearm it. Existing runtime safety handling remains unchanged. Expiry of the startup waiting period alone does not pass this check.
 - `AutoEngage`: `0` off, `1` lateral on, `2` lateral on with cruise ready.
-- `TeslaAutoTurnSignals`: default OFF, reboot required. Uses existing ATC requests on supported Model 3/Y with vehicle CAN and valid physical stalk input. It does not authorize steering or departure. See [Tesla automatic turn signals](tesla.md#automatic-turn-signals) for prerequisites and closed-course validation.
+- `TeslaAutoTurnSignals`: default OFF, reboot required. On supported Model 3/Y with vehicle CAN and valid physical stalk input, turn lamps start with turn desire, not navigation preparation or distance alone. Measured heading and wheel return govern completion; only confirmed turns can wait at standstill under fresh lateral permission. Automatic lane changes retain preparation-stage lamp confirmation. It does not authorize steering or departure. See [Tesla automatic turn signals](tesla.md#automatic-turn-signals) for prerequisites and closed-course validation.
+- `TeslaCanTrafficStop`: independent default-OFF Tesla CAN red-light stopping; restart required. Requires actual openpilot longitudinal control and the exact supported 8-byte vision-backed APP profile, not stock TACC. Below 126 m, confirmed red adds a stop constraint; green releases only its own constraint. Signal failure requests takeover/soft-disable. Other brands ignore it; see [Tesla CAN stopping](tesla.md#can-red-light-stopping) for protocol, pedal override and closed-course validation limits.
+- `TeslaManualLaneSignals`, `TeslaModelDesireSignals`, `TeslaModelPathSignals`: independent default-OFF Tesla lamp-only observations; reboot required. All require `TeslaAutoTurnSignals`, `ShareData`, fresh repeated ONNX dashed classification and supported adjacent-lane geometry above 30 km/h. Manual torque/approach can work without cruise; model desire/path predictions require active lateral control and can light early or falsely. Solid/dashed does not prove colour or traffic direction. No steering permission, navigation turn preannouncement or U-turn implementation is added; see the [Tesla guide](tesla.md#optional-lane-change-lamp-observations) for completion, timestamp and physical-validation limits.
 - `AutoCruiseControl` covers Hyundai/Kia auto-cruise and soft-hold behavior.
+- `TeslaAutoSpeedLimit`: default OFF; full restart required. ON permits automatic speed-wheel adjustment toward the vehicle DAS limit with extension CAN and alpha longitudinal; OFF removes automatic wheel output, not manual scrolling. Previously implicit activation now requires opting in. Active navigation/Carrot speed control still pauses it; see [automatic cruise set speed](tesla.md#automatic-cruise-speed).
 - `DisableMinSteerSpeed` is vehicle-specific and relates to low-speed steering restrictions on SMDPS-equipped cars.
 
 ### Buttons and presets — 15 settings
@@ -156,7 +173,7 @@ Volkswagen's separate `SET` button sets current speed and `RES` restores the pre
 | ONNX Lane and BSD | `ShareData`, `OnnxBsdEnabled`, `OnnxLaneThreshold`, `OnnxLaneIntervalMs`, `OnnxBsdThreshold`, `OnnxBsdSmoothingMs`, `OnnxBsdIntervalMs` | Lane-type detection plus separately controlled camera BSD and tuning |
 | Centering | `PathOffset`, `CameraYawTrimDeg` | Path position and camera-yaw trim |
 | Steering feel | `SteerActuatorDelay`, `LatSmoothSec`, `LatSuspendAngleDeg`, `CustomSR`, `SteerRatioRate` | Timing, smoothing, suspension angle, and steering ratio |
-| [Lane change](lane-change.md) and automatic turn | `LaneChangeNeedTorque`, `LaneChangeDelay`, `LaneChangeBsd`, `LaneLineCheck`, `BlinkerLatchedTurn`, `LaneChangeLeverWait`, `AutoTurnControl`, `AutoTurnControlRightLaneChange`, `ManualLaneChangeIndicator`, `AutoTurnControlSpeedTurn`, `AutoTurnControlTurnEnd`, `AutoTurnMapChange` | Lane-change entry conditions and ATC behavior |
+| [Lane change](lane-change.md) and automatic turn | `LaneChangeNeedTorque`, `LaneChangeDelay`, `LaneChangeBsd`, `LaneLineCheck`, `BlinkerLatchedTurn`, `LaneChangeLeverWait`, `AutoTurnControl`, `AutoTurnControlRightLaneChange`, `ManualLaneChangeIndicator`, `ManualTurnIndicator`, `ModelDesireIndicator`, `ModelPathIndicator`, `AutoTurnControlSpeedTurn`, `AutoTurnControlTurnEnd`, `AutoTurnMapChange` | Lane-change entry conditions and ATC behavior |
 | Lane mode | `LatMpcPathCost`, `LatMpcMotionCost`, `LatMpcAccelCost`, `LatMpcJerkCost`, `LatMpcSteeringRateCost`, `LatMpcInputOffset`, `UseLaneLineSpeed`, `UseLaneLineCurveSpeed`, `AdjustLaneOffset` | Lane-mode MPC weights and lane-line conditions |
 | Advanced torque | `LateralTorqueCustom`, `LateralTorqueAccelFactor`, `LateralTorqueFriction`, `LateralTorqueKpV`, `LateralTorqueKiV`, `LateralTorqueKf`, `LateralTorqueKd` | Custom torque-control gains |
 | Advanced torque, search only | `NNFF` | Neural-network feedforward for torque steering |
@@ -221,7 +238,7 @@ While external navigation is connected, deceleration, countdowns, and navigation
 | [Driving mode](cruise-gap.md#driving-mode) | `MyDrivingMode`, `MyDrivingModeAuto` | Eco, safe, normal, high-speed modes and automatic selection |
 | [Speed-based acceleration](cruise-gap.md#acceleration-table) | `CruiseMaxVals0` through `CruiseMaxVals6` | Maximum acceleration tendency by speed band |
 | [Stopping and restarting](cruise-gap.md#stop-resume) | `StopDistanceCarrot`, `StoppingAccel`, `VEgoStopping`, `AChangeCostStarting` | Stop position, stop entry, and restart behavior |
-| [Longitudinal tuning](cruise-gap.md#longitudinal-tuning) | `LongTuningKpV`, `LongTuningKiV`, `LongTuningKf`, `LongActuatorDelay` | Hyundai/Kia/Genesis fix/hide `100/0/100`; Toyota/Lexus fix/hide `0/0/100`; VW MEB, including ID.4, applies saved gains |
+| [Longitudinal tuning](cruise-gap.md#longitudinal-tuning) | `LongTuningKpV`, `LongTuningKiV`, `LongTuningKf`, `LongActuatorDelay` | Ray EV Comma Pedal applies saved gains; other Hyundai/Kia/Genesis fix/hide `100/0/100`; Toyota/Lexus fix/hide `0/0/100`; VW MEB, including ID.4, applies saved gains |
 | [Following gap](cruise-gap.md#following-gap) | `TFollowGap1` through `TFollowGap4`, `DynamicTFollowLC`, `SpeedTFFactor`, `TFollowDecelBoost` | Gap times, lane-change relief using selected leads, and deceleration margin (default 0%) |
 | [Following responsiveness](cruise-gap.md#lead-response) | `LeadAccelResponse`, `LeadAccelResponseTF1`–`LeadAccelResponseTF4` | Lead-start, acceleration and approach response at every following-distance level |
 | [Carrot cruise](cruise-gap.md#carrot-cruise) | `CruiseEcoControl`, `CruiseCoastingPercent`, `CarrotCruiseDecel`, `CarrotCruiseAtcDecel` | Economy control, coasting margin with a fixed entry reference (default 0%: existing control), and cruise deceleration limits |
@@ -241,7 +258,7 @@ Eco caps lead response at 2 and Safe at 3; Normal and High retain the selected v
 
 Deceleration preview operates independently of the response level. During active control, remaining correction releases progressively when relative acceleration eases or the lead switches between radar and vision or disappears. Accelerator or brake intervention and longitudinal control exit clear it immediately.
 
-`LongTuning*` and `LongActuatorDelay` are advanced settings that directly affect vehicles using openpilot longitudinal control. Hyundai, Kia, and Genesis fix `LongTuningKpV`, `LongTuningKiV`, and `LongTuningKf` at the safe `100/0/100` values and hide them from settings. Toyota/Lexus fix and hide common gains at `0/0/100` to avoid duplicate correction before their dedicated controller. Some parameters have no effect when stock ACC remains responsible for acceleration and braking.
+`LongTuning*` and `LongActuatorDelay` are advanced settings that directly affect vehicles using openpilot longitudinal control. Identified Ray EV Comma Pedal configurations expose these gains and apply saved values to speed PID. Other Hyundai, Kia, and Genesis configurations fix `LongTuningKpV`, `LongTuningKiV`, and `LongTuningKf` at the safe `100/0/100` values and hide them from settings. Toyota/Lexus fix and hide common gains at `0/0/100` to avoid duplicate correction before their dedicated controller. Some parameters have no effect when stock ACC remains responsible for acceleration and braking.
 
 `StoppingAccel` is adjustable again: default `-50`, range `-100 to -50`, step `10`. The stored value is multiplied by 0.01, with the same bounds enforced by control. Original stop-entry and braking behavior and vehicle-specific soft hold are restored; changes apply within about one second. See [Stopping and restarting](cruise-gap.md#stop-resume).
 
@@ -249,7 +266,7 @@ Deceleration preview operates independently of the response level. During active
 
 For Hyundai/Kia CANFD openpilot longitudinal control, aReqRaw and aReqValue become zero in the first StopReq frame, so this setting does not change transmitted acceleration while StopReq remains active. Automatic release/retry is removed.
 
-On supported Tesla vehicles with the additional vehicle bus detected, the device's **alpha longitudinal** (`AlphaLongitudinalEnabled`) toggle also enables [automatic cruise set-speed adjustment](tesla.md#automatic-cruise-speed) to the vehicle-reported limit. Navigation/Carrot speed control takes precedence and pauses DAS-based adjustment until it ends and the limit is stable again; any manual pause remains in effect. Turning the right speed wheel pauses it; an opposite-direction wheel gesture within one second or disengaging and re-engaging resumes it. There is no separate Carrot Web setting for this feature.
+On supported Tesla vehicles, [automatic cruise set-speed adjustment](tesla.md#automatic-cruise-speed) requires the additional vehicle bus, **alpha longitudinal** (`AlphaLongitudinalEnabled`) and Carrot Web's `TeslaAutoSpeedLimit`. The new switch defaults to OFF and requires a full restart after changes. Navigation/Carrot speed control still takes precedence and pauses DAS-based adjustment until it ends and the limit is stable again; any manual pause remains in effect. Turning the right speed wheel pauses it; an opposite-direction wheel gesture within one second or disengaging and re-engaging resumes it. OFF stops automatic wheel output without disabling manual scrolling.
 
 <a id="vehicle-hardware"></a>
 ## Vehicle and hardware
@@ -263,7 +280,7 @@ These settings describe the car, harness, and device hardware configuration. Do 
 | Radar | `EnableRadarTracks`, `RadarTrackFlip`, `EnableCornerRadar`, `CarrotRadarMode`, `CarrotRadarCutInSensitivity` | SCC radar, front-track orientation, corner radar, and Carrot Radar processing and cut-in sensitivity |
 | Driver monitoring | `DriverMonitoringEnabled` (search only), `DriverMonitoringMode`, `CarrotVisionEnabled`, `MuteDoor`, `MuteSeatbelt` | Driver monitoring and selected vehicle alerts |
 | Vehicle assistance | `MaxAngleFrames`, `SpeedFromPCM` | Steering-angle frames and stock-SCC speed control |
-| Device hardware | `HardwareC3xLite` | Speakerless C3X Lite audio and process configuration |
+| Device hardware | `CommaPedalEnabled`, `HardwareC3xLite` | Comma Pedal permission for vehicles without ACC, and C3X Lite hardware configuration |
 
 > [!CAUTION]
 > Incorrect `HyundaiCameraSCC`, `CanfdHDA2`, `EnableRadarTracks`, `CarrotRadarMode`, `CarrotRadarCutInSensitivity`, or `SpeedFromPCM` values can change vehicle identification, SCC, radar, or longitudinal behavior. Confirm the vehicle, model year, HDA generation, harness location, and whether stock ACC is retained.
@@ -277,6 +294,8 @@ Regardless of gear or speed, including at standstill, three distinct physical CA
 See [Radar tracks and corner radar](radar.md) before changing radar modes.
 
 **Cluster CAN Direct Send** (`HyundaiCanfdClusterDirectTx`) compares the original direct-send method on Hyundai/Kia/Genesis CAN-FD CameraSCC vehicles with intermittent cluster warnings. It defaults to OFF for every vehicle; enable it manually on an affected vehicle. Reboot the device after changing it. Updated Panda firmware supporting this setting is required. Resolution of vehicle warnings has not been validated.
+
+With CAN-FD CameraSCC, openpilot longitudinal control and corner radar enabled, valid CAN, Drive, released brakes and speed above 10.8 km/h allow periodic requests to switch on stock SCC MAIN. This applies independently of AutoEngage and Carrot cruise engagement, and these requests stop once MAIN is on. SET and standstill-resume requests retain the existing Carrot cruise engagement requirement. With CAN-FD CameraSCC and openpilot longitudinal control, the OEM SCC MAIN state used for cluster display is tracked separately from Carrot engagement intent. Steering activation follows AutoEngage initialization and the existing driver-button settings.
 
 With `HyundaiCameraSCC=0` and no camera-SCC configuration already applied to the vehicle, receiving `SCC_CONTROL` (CAN-FD) or `SCC12` (classic CAN) on the camera bus during the current onroad session adds **Enable CameraSCC** to the CAN error alert. This is bus2, or the corresponding camera bus with multiple Pandas. The hint uses reception history and does not establish the cause of every CAN error. It never changes the setting automatically; existing disengagement and engagement blocking remain active. Select the mode appropriate for the vehicle and wiring while stopped, then verify it in the next onroad session.
 
@@ -293,6 +312,10 @@ In modes `EnableRadarTracks=1`–`3`, a confirmed departing front lead can recei
 `CarrotRadarMode` continuously tracks vehicles with the front and corner radars to detect cut-ins, then matches camera and radar information in a new way to select the vehicle ahead. On vehicles with neither corner-radar nor radar-track support, it behaves the same as the existing mode. It can change acceleration and braking, so enable it only on the same vehicle after completing validation. The value is latched when the next OnRoad session starts, so end the current drive and restart the vehicle or reboot the device after changing it. The previous `RadarMotionMode` value is migrated to the new name once on the first startup after updating.
 
 `CarrotRadarCutInSensitivity` controls only Carrot Radar Mode CUT-IN detection: `0` disables it, `1` is insensitive, `3` is normal (default), and `5` is very sensitive; `2` and `4` are the intermediate levels. Levels `1` through `5` require `0.50`, `0.40`, `0.35`, `0.25`, and `0.20 s` of continuing measured motion evidence, while the physical future prediction remains fixed at 5.0 seconds. A front-radar track with at least 0.50 m of strongly one-way progress in its recent measured history may receive at most one 20 Hz radar-frame credit so timestamp quantization does not discard a completed dwell; small adjacent drift does not. It does not affect conventional radar mode or `EnableCornerRadar`. The value is read at the next OnRoad start, so restart the vehicle or reboot the device after changing it.
+
+`CommaPedalEnabled` defaults to OFF. It permits the Comma Pedal longitudinal path on vehicles without ACC carrying the `CC_ONLY_CAR` flag when explicit vehicle configuration, device CAN reception, and the existing control and safety conditions are satisfied. It works only while the vehicle's **Cruise ready is off**; when Cruise ready is on, OEM cruise control takes priority and Comma Pedal control is unavailable. The shared protocol is reusable; the supplied DBC, tuning, and safety profile are for Kia Ray EV. Other vehicles require their own configuration and never inherit the Ray values automatically.
+
+A saved change takes effect at the **next vehicle-parameter initialization**; it does not switch the running control path immediately. Comma Pedal operation on CarrotPilot has not yet been validated in a vehicle. Pedal firmware and voltage calibration are unchanged. See the [Comma Pedal diagnostic guide](../../comma_pedal.md) for the observations required at each stage.
 
 `HardwareC3xLite` must remain off on standard C3 and C3X hardware. Enable it only on a C3X Lite, then reboot the device. The setting skips the unavailable amplifier so startup is not delayed by I2C retries, uses the GPIO buzzer for alerts, disables `micd`, `soundd`, and `loggerd`, and turns off `RecordAudio`. Normal route logging is unavailable while this hardware mode is enabled.
 
@@ -350,6 +373,10 @@ An APN label remaining in the `ShowRouteInfo` description refers to route-input 
 While the external HUD is connected over USB, `ShowCameraWithCluster=0` switches the on-device driving view on both regular C3/C3X hardware and mici to a black background and skips camera-video and model-path rendering. Setting it to `1` removes that connection-specific suppression and uses the normal on-device camera and on-road rendering path. A live change takes effect within about five seconds. Speed, speed limit, driver state, alerts, and the driving-state border remain visible with either value, and the option has no display effect after the external HUD disconnects. With value `0`, `camerad` and model input continue running; only duplicate rendering on the device display is reduced.
 
 The final `ClusterHudScreenMode` layout is:
+
+On `thftgr/carrot-wip-cluster`, onroad P selects the parking screen and R selects the reverse reference screen ahead of the selected mode. P shows the clock, tyre pressures, trip statistics and available battery level; R shows a steering-based guide and blind-spot state. Other gears and offroad restore the existing `carrot-wip` display. The driving layout and device-screen sleep behavior are unchanged.
+
+P/R car images follow the detected supported vehicle, falling back to EV6. Reverse lines use illustrative EV6 geometry; they are not rear-camera video or obstacle detection. Create `/data/ev6_park_screen_off` or `/data/ev6_reverse_screen_off` to disable only that screen. `/data/ev6_weather_off` disables parking weather queries. Weather uses the last position rounded to approximately 1 km for Open-Meteo and caches results for up to one hour.
 
 - `-1` uses the full width only in 3D camera views `0` and `1`, with no information panel or world shift. Left-side HUD items retain their margins, right-side gauges and TPMS align to the physical right edge, and the clock, world, and turn signals use the full-display center axis. In road-camera view `2`, it behaves exactly like mode `0`, including automatic navigation/report selection and `ClusterHudPanelLayout`.
 - `0` is the default screen. It shows navigation while live navigation is received and automatically shows the driving report otherwise.
@@ -425,7 +452,7 @@ See the Wiki [Tuning introduction](https://github.com/ajouatom/openpilot/wiki/Gu
 
 Open **Tools ? Nav Map / ?? ??** in Carrot Web to view the map, search/select a destination, or clear it. Register a Public key under **Settings ? Network ? Mapbox** first; this feature does not need a Secret key. Destinations survive restart. A connected external navigator owns both TBT and route; a missing external route is never replaced with saved Mapbox geometry.
 
-The map is generated onroad with usable position and guidance. USB screen mode `ClusterHudScreenMode=7` displays the same image beside the driving view, on the right. N16 Nav uses navigation inputs on both eGPU and Jetson. Flip Flop and Light speed do not support NOO; the internal CD210 and driver-monitoring model are independent. Mapbox search, directions and tiles require network access and a suitable account/key. Search requests use Permanent Geocoding so selected destinations can be saved. See [design and validation limits](../../nav_model_integration_20261012.md).
+The map is generated onroad with usable position and guidance. USB screen mode `ClusterHudScreenMode=7` displays the same image beside the driving view, on the right. N16 Nav uses navigation inputs on both eGPU and Jetson. Flip Flop, Light speed and Light speed 2 do not support NOO; the internal CD210 and driver-monitoring model are independent. Mapbox search, directions and tiles require network access and a suitable account/key. Search requests use Permanent Geocoding so selected destinations can be saved. See [design and validation limits](../../nav_model_integration_20261012.md).
 # Lead brake lamp observation (trial)
 
 **Lead Brake Lamp Observation** (`LeadBrakeLights`) in Traffic Light settings
@@ -442,9 +469,11 @@ camera supplies 20fps. Reduced processing overhead does not establish sustained
 
 ## Automatic turn signals (supported vehicles)
 
-`AutoBlinkerControl` — Settings > Driving > Steering > Lane Change (Auto Turn). Default: 0. Currently limited to the Ioniq 5 PE, Jetson and PEAK USB-CAN/B1 profile on carrot-wip.
+`AutoBlinkerControl` — Settings > Driving > Steering > Lane Change (Auto Turn). Default: 0. Currently limited to the Ioniq 5 PE, Jetson and PEAK USB-CAN/B1 profile on carrot-wip. Cruise CANCEL stops automatic indicator requests and releases an automatic hold. Parking maneuvers no longer trigger an indication until SET/RES or +/− clears the cruise cancel state. The stock lever and explicit Bluetooth indicator buttons remain available.
 
-An acknowledged ATC turn is not completed by an approach bend while navigation still places the same turn ahead. With the original hold still valid and no driver cancellation or communication failure, both lamps remaining off for 1.5 seconds allows one recovery attempt for that turn. Unconfirmed initial starts, manual/Bluetooth cancellation, opposite indicators and navigation cancellation do not trigger recovery. Physical lamp recovery still needs vehicle acceptance.
+ATC indication starts at audioTurn and persists through stops. A fresh cue can start at a full stop in Drive when lateral permission remains valid and steering is fault-free. After the receiver confirms send completion, both lamps staying off for 1.5 seconds permits one recovery attempt per turn, including an initially unlit request. Driver cancellation, communication failure or an unconfirmed send forbids retry. A fresh opposite-turn cue waits at most three seconds for physical completion of the preceding turn.
+
+When a usable TBT point and raw vehicle GPS are available, passage evidence supplements physical turn completion. Continuing straight sufficiently beyond a closely passed point cancels the indication without replaying the same audioTurn. Accuracy, continuity and direction checks disable this location-based cancellation for poor GPS, missing points or curved approaches. Fresh navigation status reporting guidance ended or off-route also releases automatic indication. Physical lamps and road behavior still need validation.
 
 ### Behavior
 
@@ -468,8 +497,21 @@ USB-CAN requests the initial blink; the existing vehicle indicator-hold function
 
 A hold-start request without confirmed lamp activation expires after four seconds, allowing the next button press to start a new request.
 
-`AutoTurnControlRightLaneChange` under ATC details adds to modes 1 and 2 and triggers the physical right indicator before a TBT right turn or right fork, at an eligible lane-change speed and within 250 m, until turning starts. It requires the supported USB2CAN indicator setup, a right lane, fresh OEM BSD and right-front gaps of at least 5 m both now and after three seconds; existing manual/Bluetooth lane-change behavior is unchanged. See [lane changes](lane-change.md).
+`AutoTurnControlRightLaneChange` under ATC details adds to modes 1 and 2 and triggers the physical right indicator before a TBT right turn or right fork, at 10km/h or above and within the configured distance, until turning starts. It requires the supported USB2CAN indicator setup, a right lane, fresh OEM BSD and right-front gaps of at least 5 m both now and after three seconds; existing manual/Bluetooth lane-change behavior is unchanged. See [lane changes](lane-change.md).
 
-`AutoTurnControlRightLaneChange` is the separate ATC-details add-on for modes 1 and 2, within 250 m of a right turn or right fork. `ManualLaneChangeIndicator` is independent of ATC and detects driver boundary approach during preparation. It can bridge at most one second of confidence loss after observing the crossed boundary. An executing automatic lane change or another indicator request takes precedence; its lamp feedback never creates a new steering request. See [lane changes](lane-change.md).
+`ManualTurnIndicator` requests an indicator when driver steering and vehicle rotation agree. The wheel must reach 42 degrees and move at least 22 degrees from the start of steering. Detection resumes two seconds after the previous indication last renewed its hold, once both lamps have also been off for one continuous second. The setting defaults to off and can detect parking turns. [Manual turn conditions](lane-change.md)
+
+`AutoTurnControlRightLaneChange` remains the separate ATC distance add-on. `ManualLaneChangeIndicator` detects manual lane changes from 5 km/h and retains recent driver intent for up to 1.5s. The left side excludes centre lines using fresh white-line classification; the right requires at least 2.5m from the target boundary to the road edge. Outer-line probability is not required. It never requests automatic steering. See [lane changes](lane-change.md).
 
 The manual lane-change indicator can request again after at least three seconds, one continuous second of lamp extinction and fresh steering/approach conditions. Automatic-steering feedback isolation remains at least 12 seconds.
+
+An ATC recovery attempt has a new four-second activation deadline. It does not extend the five-minute maximum measured from the original request.
+
+`ModelDesireIndicator` and `ModelPathIndicator` are separate default-off indication-only options. See [lane changes](lane-change.md) for TBT distance holding and each feature’s start/end conditions. At 30 km/h or above, the two nearest model forecasts can also trigger an indication when both predict the same lane change with at least 65% probability and both measured lane boundaries show the vehicle approaching that side. A forecast alone does not light the indicator or request steering. After forecast-based initiation, widening lane lines at a fork do not end the hold while the model and measured motion still indicate the same direction. Fading or opposite intent ends the fork hold; cruise CANCEL releases it immediately.
+
+Manual indication projects 0.3s of measured boundary approach, advancing the centre-to-boundary threshold by at most 0.3m. Existing speed, centre-line and road-edge gates remain.
+
+After confirmed turn entry, the TBT indicator ends its hold as the wheel returns within ±15 degrees while moving, without waiting for the remaining 30m. Pre-turn traffic-light waits remain held; see [lane changes](lane-change.md) for the entry conditions.
+
+
+The ATC right lane-change distance uses 0m for off and 50m steps up to 500m. The former ON setting migrates to 250m at restart.

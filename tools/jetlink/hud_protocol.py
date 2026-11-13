@@ -169,6 +169,8 @@ class SnapshotBuilder:
               'valid': self.sm.valid, 'alive': self.sm.alive, 'cameras': self.camera_previews()}
     from hud_signal import signal_packet
     record['signal_display'] = signal_packet(now)
+    from openpilot.common.indicator_display import current
+    record['indicator_display'] = current()
     if self.nav_map is not None:
       preview = self.nav_map.packet(self.settings.get('ClusterHudScreenMode') == 'Nw==')
       if preview is not None:
@@ -177,9 +179,14 @@ class SnapshotBuilder:
 
 
 def encode_snapshot(record):
+  indicator = record.get('indicator_display')
+  if indicator and indicator.get('origin') == 'manual_turn':
+    # Older HUD bundles know the driver-indicator origin and turning reason.
+    record = dict(record, indicator_display=dict(indicator, origin='manual'))
   data = json.dumps(record, separators=(',', ':')).encode()
   if len(data) > 96 * 1024:
     # Optional signal metadata must not evict an existing camera or NAV image.
+    record.pop('indicator_display', None)
     record.pop('signal_display', None)
     data = json.dumps(record, separators=(',', ':')).encode()
   if len(data) > 96 * 1024:

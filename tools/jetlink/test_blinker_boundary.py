@@ -4,6 +4,8 @@ from types import SimpleNamespace as N
 import pytest
 
 from openpilot.selfdrive.controls.lib.desire_lib.boundary_indicator import BoundaryIndicator
+from openpilot.selfdrive.controls.lib.desire_lib.boundary_lane import MANUAL_INDICATOR_MIN_SPEED
+from blink_observation import allowed as observation_allowed
 from blink_boundary import BoundaryEvents, vehicle_allowed
 from blink_protocol import wire_record
 
@@ -19,11 +21,29 @@ def scene(direction=1):
     steerFaultTemporary=False,
     steerFaultPermanent=False,
     vEgo=15.0,
+    leftLaneLine=10, rightLaneLine=10, laneLineInfoMonoTime=0,
     steeringPressed=True,
     steeringTorque=300.0 if direction == 1 else -300.0,
   )
   md = N(frameId=0, laneLines=[N(y=[-5.4]), N(y=[-1.8]), N(y=[1.8]), N(y=[5.4])], laneLineProbs=[0.9] * 4)
+  prepare_scene(cs, md, 10.)
   return cs, md
+
+
+def prepare_scene(cs, md, now):
+  cs.laneLineInfoMonoTime = int(now * 1e9)
+  for lane in md.laneLines:
+    if len(lane.y) == 1:
+      lane.y = lane.y * 9
+  md.laneLines[0].y = [v - 3.6 for v in md.laneLines[1].y]
+  md.laneLines[3].y = [v + 3.6 for v in md.laneLines[2].y]
+  md.roadEdges = [N(y=[v - 7.2 for v in md.laneLines[1].y]), N(y=[v + 7.2 for v in md.laneLines[2].y])]
+  md.roadEdgeStds = [.1, .1]
+
+
+def update(b, now, cs, md, **kwargs):
+  prepare_scene(cs, md, now)
+  b.update(now, cs, md, **kwargs)
 
 
 def drive(b, cs, md, direction=1, *, enabled=True, valid=True, busy=False):
@@ -35,7 +55,7 @@ def drive(b, cs, md, direction=1, *, enabled=True, valid=True, busy=False):
     md.frameId = i
     md.laneLines[1].y = [-y if direction == 1 else -(3.6 - y)]
     md.laneLines[2].y = [3.6 - y if direction == 1 else y]
-    b.update(t, cs, md, enabled=enabled, valid=valid, busy=busy)
+    update(b, t, cs, md, enabled=enabled, valid=valid, busy=busy)
     if b.request_direction:
       seen.append((t, b.request_direction, b.request_time))
   return seen
@@ -51,13 +71,29 @@ def test_both_directions_need_real_driver_motion_and_emit_one_edge(direction):
   assert b.filter_lamp(direction) == 0
 
 
+@pytest.mark.parametrize('speed_kph,expected', [(0, False), (4.9, False), (5, True), (10, True), (26.4, True)])
+@pytest.mark.parametrize('direction', [1, 2])
+def test_slow_manual_lane_crossing_reaches_both_indicator_gates(speed_kph, expected, direction):
+  cs, md = scene(direction)
+  cs.vEgo = speed_kph / 3.6
+  observer = BoundaryIndicator(minimum_speed=MANUAL_INDICATOR_MIN_SPEED)
+  assert bool(drive(observer, cs, md, direction)) == expected
+  assert not drive(BoundaryIndicator(), cs, md, direction)  # standard 30 km/h profile
+  side = 'left' if direction == 1 else 'right'
+  md.meta = N(observedIndicator=side, laneChangeState='off')
+  t = cs.laneLineInfoMonoTime / 1e9
+  assert vehicle_allowed(cs, direction) == expected
+  assert observation_allowed(cs, N(latActive=False), md, 'manual', t) == expected
+  assert not observation_allowed(cs, N(latActive=True), md, 'model_path', t)
+
+
 @pytest.mark.parametrize(
   'field,value',
   [
     ('steeringPressed', False),
     ('steeringTorque', -300.0),
     ('steeringTorque', math.nan),
-    ('vEgo', 8.0),
+    ('vEgo', 4.9 / 3.6),
     ('vEgo', math.nan),
     ('gearShifter', 'park'),
     ('canValid', False),
@@ -73,7 +109,8 @@ def test_driver_vehicle_and_existing_signal_gates(field, value):
   cs, md = scene()
   setattr(cs, field, value)
   assert not drive(b, cs, md)
-  assert not vehicle_allowed(cs, 1)
+  if field != 'steeringPressed' and not (field == 'steeringTorque' and value == -300.0):
+    assert not vehicle_allowed(cs, 1)
 
 
 @pytest.mark.parametrize('key', ['enabled', 'valid', 'busy'])
@@ -100,12 +137,12 @@ def test_inhibit_survives_disable_dark_flash_and_restart_journal():
     for i in range(300):
       now = stamp + 0.2 + i * 0.05
       cs.leftBlinker = (i % 16) < 8
-      b.update(now, cs, md, enabled=False, valid=True, busy=False)
+      update(b, now, cs, md, enabled=False, valid=True, busy=False)
       assert b.filter_lamp(1) == 0
       assert b.request_direction == 0
     cs.leftBlinker = False
     for i in range(23):
-      b.update(stamp + 16 + i * 0.05, cs, md, enabled=False, valid=True, busy=False)
+      update(b, stamp + 16 + i * 0.05, cs, md, enabled=False, valid=True, busy=False)
     assert b.filter_lamp(1) == 1
 
 
@@ -113,7 +150,7 @@ def test_stale_future_or_malformed_journal_cannot_create_request():
   cs, md = scene()
   for journal in ({'time': -99.0, 'direction': 1}, {'time': 100.0, 'direction': 1}, [], {'time': math.nan, 'direction': 1}):
     b = BoundaryIndicator(journal)
-    b.update(10.0, cs, md, enabled=False, valid=True, busy=False)
+    update(b, 10.0, cs, md, enabled=False, valid=True, busy=False)
     assert b.blocked == 0 and b.request_direction == 0
 
 
@@ -126,7 +163,7 @@ def test_jumps_gaps_and_duplicate_frames_never_trigger():
       y = 1.8 if i % 2 else 0.6
       md.laneLines[1].y = [-y]
       md.laneLines[2].y = [3.6 - y]
-      b.update(10 + i * (0.5 if mode == 'gap' else 0.05), cs, md, enabled=True, valid=True, busy=False)
+      update(b, 10 + i * (0.5 if mode == 'gap' else 0.05), cs, md, enabled=True, valid=True, busy=False)
       assert b.request_direction == 0
 
 
@@ -182,7 +219,9 @@ def test_lamp_and_synthesized_stalk_feedback_cannot_request_steering(monkeypatch
 
 @pytest.mark.parametrize('atc,state,nav_fresh', [('none', 'off', True), ('atc left', 'preLaneChange', True),
                                                ('fork right', 'preLaneChange', True), ('turn left', 'off', False)])
-def test_actual_source_loop_emits_once_after_journal_and_never_holds(monkeypatch, atc, state, nav_fresh):
+@pytest.mark.parametrize('lane_available', [True, False])
+@pytest.mark.parametrize('observed', [False, True])
+def test_actual_source_loop_journals_then_taps_legacy_or_holds_observation(monkeypatch, atc, state, nav_fresh, lane_available, observed):
   import sys
   import json
   import types
@@ -197,11 +236,15 @@ def test_actual_source_loop_emits_once_after_journal_and_never_holds(monkeypatch
   base, _ = scene()
   for k, v in vars(base).items():
     setattr(cs, k, v)
-  sm['modelV2'] = N(
-    meta=N(
+  sm['modelV2'] = scene()[1]
+  sm['modelV2'].meta = N(
       desire='none', autoTurnSignal='none', autoTurnSignalLaneChange=False, laneChangeState=state, manualLaneIndicator='none', manualLaneIndicatorMonoTime=0
-    )
   )
+  if observed:
+    sm['modelV2'].meta.observedIndicator = 'none'
+    sm['modelV2'].meta.observedIndicatorMonoTime = 0
+    sm['modelV2'].meta.observedIndicatorSource = 'manual'
+    sm['modelV2'].meta.indicatorIsolationMask = 0
   sm['carrotMan'] = N(atcType=atc, xDistToTurn=0)
   sm['livePose'] = N(inputsOK=True, sensorsOK=True, posenetOK=True, orientationNED=N(valid=True, z=0.0))
   sm.services = list(sm)
@@ -213,10 +256,18 @@ def test_actual_source_loop_emits_once_after_journal_and_never_holds(monkeypatch
     i = len(sent)
     clock[0] = 10.0 + i * 0.05
     sm.recv_time = dict.fromkeys(sm, clock[0])
+    prepare_scene(cs, sm['modelV2'], clock[0])
+    cs.leftLaneLine = 10 if lane_available else 21
+    cs.steeringPressed = False
+    cs.steeringTorque = 0.
     sm['selfdriveState'].atcTurnStartMonoTime = 0
     sm['selfdriveState'].atcTurnDirection = 'none'
     sm['modelV2'].meta.manualLaneIndicator = 'left' if 2 <= i < 5 else 'none'
     sm['modelV2'].meta.manualLaneIndicatorMonoTime = 10100000000 if i >= 2 else 0
+    if observed:
+      sm['modelV2'].meta.observedIndicator = 'left' if lane_available and 2 <= i < 5 else 'none'
+      sm['modelV2'].meta.observedIndicatorMonoTime = 10100000000 if i >= 2 else 0
+      sm['modelV2'].meta.indicatorIsolationMask = 1 if i >= 2 else 0
 
   sm.update = tick
   fake_params = types.ModuleType('openpilot.common.params')
@@ -238,7 +289,7 @@ def test_actual_source_loop_emits_once_after_journal_and_never_holds(monkeypatch
 
   def send(raw):
     value = json.loads(raw)
-    if value['events']:
+    if value['events'] or value['hold']:
       assert any(path.name == 'boundary-indicator.json' for path, _ in saved)
     sent.append(value)
 
@@ -252,8 +303,16 @@ def test_actual_source_loop_emits_once_after_journal_and_never_holds(monkeypatch
   monkeypatch.setattr(model, 'atomic_json', lambda path, value: saved.append((path, value)))
   source.main(0)
   events = [e for v in sent for e in v['events']]
-  assert len(events) == 1 and events[0]['direction'] == 'left'
-  assert all(v['hold'] is None for v in sent)
+  if observed:
+    assert not events
+    holds=[v['hold'] for v in sent if v['hold']]
+    assert bool(holds) == lane_available
+    assert not holds or len({h['id'] for h in holds}) == 1
+    assert sent[-1]['hold'] is None
+  else:
+    assert len(events) == (1 if lane_available else 0)
+    assert not events or events[0]['direction'] == 'left'
+    assert all(v['hold'] is None for v in sent)
 
 
 @pytest.mark.parametrize("direction", [1, 2])
@@ -282,16 +341,16 @@ def test_startup_without_owned_request_preserves_existing_lamps(busy, direction)
 
 
 @pytest.mark.parametrize('direction', [1, 2])
-@pytest.mark.parametrize('age,expected', [(0.8, True), (1.1, False)])
-def test_confidence_loss_only_tracks_a_recently_seen_crossed_boundary(direction, age, expected):
+@pytest.mark.parametrize('age,expected', [(0.8, True), (1.1, True)])
+def test_confidence_is_anchored_when_a_continuous_driver_episode_starts(direction, age, expected):
   b = BoundaryIndicator()
   cs, md = scene(direction)
   # First establish stable geometry and a driver direction without approaching.
   for i in range(40):
     md.frameId = i
-    b.update(10+i*.05, cs, md, enabled=True, valid=True, busy=False)
+    update(b, 10+i*.05, cs, md, enabled=True, valid=True, busy=False)
   last_confident = 11.95
-  md.laneLineProbs = [.01]*4
+  md.laneLineProbs = [.9, .01, .01, .9]
   seen = []
   # Approach continuously; the confidence timestamp must never refresh from geometry.
   for i in range(1, int(age/.05)+2):
@@ -299,7 +358,7 @@ def test_confidence_loss_only_tracks_a_recently_seen_crossed_boundary(direction,
     y = 1.8 - .95 * min(i*.05/age, 1)
     md.laneLines[1].y = [-y if direction == 1 else -(3.6-y)]
     md.laneLines[2].y = [3.6-y if direction == 1 else y]
-    b.update(last_confident+i*.05, cs, md, enabled=True, valid=True, busy=False)
+    update(b, last_confident+i*.05, cs, md, enabled=True, valid=True, busy=False)
     if b.request_direction:
       seen.append(b.request_direction)
   assert bool(seen) == expected
@@ -347,7 +406,7 @@ def test_retry_after_three_seconds_preserves_twelve_second_feedback_mask(directi
     md.frameId = i
     md.laneLines[1].y = [-y if direction == 1 else -(3.6 - y)]
     md.laneLines[2].y = [3.6 - y if direction == 1 else y]
-    b.update(now, cs, md, enabled=True, valid=True, busy=False)
+    update(b, now, cs, md, enabled=True, valid=True, busy=False)
     assert b.filter_lamp(1) == 0
     if b.request_direction:
       requests.append(b.request_time)
@@ -365,14 +424,14 @@ def test_retry_still_requires_one_second_of_valid_darkness(invalid):
   for i in range(100):
     now = 10 + i * 0.05
     cs.leftBlinker = not invalid and i % 16 < 8
-    b.update(now, cs, md, enabled=True, valid=not invalid, busy=False)
+    update(b, now, cs, md, enabled=True, valid=not invalid, busy=False)
     assert not b.request_direction
     assert b.previous is None
   cs.leftBlinker = False
   for i in range(19):
-    b.update(15 + i * 0.05, cs, md, enabled=True, valid=True, busy=False)
+    update(b, 15 + i * 0.05, cs, md, enabled=True, valid=True, busy=False)
     assert b.previous is None
-  b.update(16.05, cs, md, enabled=True, valid=True, busy=False)
+  update(b, 16.05, cs, md, enabled=True, valid=True, busy=False)
   assert b.previous is not None
   assert b.filter_lamp(1) == 0
 
@@ -386,7 +445,7 @@ def test_opposite_origin_journal_survives_source_and_model_restart():
   assert saved == [{'time': 13.05, 'direction': 2, 'mask': 3}]
   b = BoundaryIndicator(saved[0])
   cs, md = scene()
-  b.update(13.2, cs, md, enabled=True, valid=True, busy=False)
+  update(b, 13.2, cs, md, enabled=True, valid=True, busy=False)
   assert b.filter_lamp(1) == b.filter_lamp(2) == 0
   assert not b.request_direction
   restarted = BoundaryEvents(saved[0])
