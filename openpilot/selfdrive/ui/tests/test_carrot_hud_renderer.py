@@ -646,3 +646,55 @@ def test_vehicle_navigation_profile_does_not_force_speed_with_cruise_off(hud_mod
   assert override.label == "MAX"
   assert override.speed_color_mode == 0
   assert not override.force_persist
+
+@pytest.mark.parametrize("turn_info", (0, 2))
+@pytest.mark.parametrize("sdi", ("사고다발", ""))
+@pytest.mark.parametrize("width", (1200, 1920))
+def test_navigation_hud_keeps_text_in_separate_rows(hud_module, monkeypatch, turn_info, sdi, width):
+  module, _ = hud_module
+  renderer = object.__new__(module.HudRenderer)
+  renderer._font_bold = object()
+  info = {
+    "n_go_pos_dist": 54300, "n_go_pos_time": 2832, "x_turn_info": turn_info,
+    "x_dist_to_turn": 41300, "atc_type": "turn", "tbt_main_text": "아주 긴 목적지 " * 100,
+    "sdi_descr": sdi, "road_name": "아주 긴 도로 이름 " * 100,
+  }
+  monkeypatch.setattr(renderer, "_get_turn_info_hud_data", lambda: info)
+  monkeypatch.setattr(renderer, "_format_eta_text", lambda _: "도착: 47.2분(21:29)")
+  boxes, icons, rows = [], [], []
+  monkeypatch.setattr(renderer, "_draw_round_box", lambda *args, **kwargs: boxes.append(args))
+  monkeypatch.setattr(renderer, "_draw_turn_icon", lambda *args: icons.append(args))
+  monkeypatch.setattr(module, "draw_text_ui_style", lambda *args, **kwargs: rows.append((args, kwargs)))
+
+  rect = module.rl.Rectangle(15, 25, width, 1080)
+  renderer._draw_turn_info_hud(rect)
+  panel_x, panel_y, panel_w, panel_h = boxes[0][:4]
+  text_x = panel_x + (230 if turn_info else 30)
+  right_rows = [(args, kw) for args, kw in rows if kw["align"] == "left_top"]
+  assert len(right_rows) == 4
+  assert len(icons) == bool(turn_info)
+  assert right_rows[0][0][0].endswith("…")
+  assert right_rows[1][0][0] == "도착: 47.2분(21:29)"
+  assert right_rows[2][0][0] == "54.3km"
+  assert right_rows[3][0][0] == sdi if sdi else right_rows[3][0][0].endswith("…")
+
+  previous_bottom = panel_y
+  for (text, x, y, size, _), kw in right_rows:
+    measured = module.measure_text_cached(renderer._font_bold, text, size)
+    assert x == text_x and kw["y_offset"] == 0
+    assert x + measured.x + kw["shadow_offset"] < panel_x + panel_w
+    assert y - kw["border_width"] > previous_bottom
+    previous_bottom = y + measured.y + kw["shadow_offset"]
+  assert previous_bottom < panel_y + panel_h
+
+  if turn_info:
+    arrow_x, _, arrow_w, _ = boxes[1][:4]
+    assert arrow_x + arrow_w < text_x - 10
+    (text, x, _, size, _), kw = next(row for row in rows if row[1]["align"] == "center_bottom")
+    measured = module.measure_text_cached(renderer._font_bold, text, size)
+    assert x + measured.x / 2 + kw["shadow_offset"] <= arrow_x + arrow_w
+  if sdi:
+    badge_x, badge_y, badge_w, badge_h = boxes[-1][:4]
+    assert badge_x + badge_w < panel_x + panel_w
+    assert badge_y + badge_h < panel_y + panel_h
+
