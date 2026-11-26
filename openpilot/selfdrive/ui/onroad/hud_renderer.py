@@ -1240,17 +1240,26 @@ class HudRenderer(Widget):
     else:
       return f"{dist_m / 1000.0 * KM_TO_MILE:.1f}mile"
 
-  def _draw_text_left_bottom(self, text: str, x: float, y: float, size: int, color, font=None, border_width: float = 2.0, shadow_offset: float = 4.0):
-    if not text:
-      return
-
-    draw_text_ui_style(
-      text, x, y, size, color,
-      font=font or self._font_display,
-      border_width=border_width,
-      shadow_offset=shadow_offset,
-      align="left_bottom",
-    )
+  def _fit_turn_hud_text(self, text: str, font_size: int, max_width: float,
+                         max_height: float, *, ellipsize: bool = False) -> tuple[str, int]:
+    # Navigation labels are single-line; reserve space for their outline/shadow.
+    text = " ".join(text.split())
+    for size in range(font_size, 0, -1):
+      measured = measure_text_cached(self._font_bold, text, size)
+      if measured.y > max_height:
+        continue
+      if measured.x <= max_width:
+        return text, size
+      if ellipsize and measure_text_cached(self._font_bold, "…", size).x <= max_width:
+        lo, hi = 0, len(text)
+        while lo < hi:
+          mid = (lo + hi + 1) // 2
+          if measure_text_cached(self._font_bold, text[:mid] + "…", size).x <= max_width:
+            lo = mid
+          else:
+            hi = mid - 1
+        return text[:lo].rstrip() + "…", size
+    return "", 1
 
   def _draw_turn_icon(self, turn_info: int, bx: int, by: int, icon_size: int = 140):
     if turn_info == 1:
@@ -1301,7 +1310,6 @@ class HudRenderer(Widget):
 
     tbt_x = int(rect.x + rect.width - 800)
     tbt_y = int(rect.y + rect.height - 250)
-
     self._draw_round_box(
       tbt_x,
       tbt_y - 60,
@@ -1314,14 +1322,12 @@ class HudRenderer(Widget):
       line_thickness=2,
     )
 
-    if info["tbt_main_text"]:
-      self._draw_text_left_bottom(
-        info["tbt_main_text"], tbt_x + 20, tbt_y - 15, 40, rl.WHITE,
-        font=self._font_bold, border_width=2.0, shadow_offset=4.0,
-      )
-
+    # Keep the arrow and its distance inside the left column. The right column
+    # starts beyond the arrow background, with independent, bounded text rows.
     x_turn_info = info["x_turn_info"]
     x_dist_to_turn = info["x_dist_to_turn"]
+    text_x = tbt_x + (230 if x_turn_info > 0 else 30)
+    text_width = tbt_x + 760 - text_x
 
     if x_turn_info > 0:
       bx = tbt_x + 100
@@ -1340,55 +1346,40 @@ class HudRenderer(Widget):
 
       self._draw_turn_icon(x_turn_info, bx, by, 140)
 
-      dist_text = self._format_turn_distance_text(x_dist_to_turn)
+      dist_text, dist_size = self._fit_turn_hud_text(
+        self._format_turn_distance_text(x_dist_to_turn), 40, 146, 40,
+      )
       if dist_text:
         draw_text_ui_style(
-          dist_text,
-          bx, by + 120, 40, rl.WHITE,
-          font=self._font_bold,
-          border_width=2.0,
-          shadow_offset=4.0,
-          align="center_bottom",
+          dist_text, bx, by + 120, dist_size, rl.WHITE,
+          font=self._font_bold, border_width=2.0, shadow_offset=4.0,
+          align="center_bottom", y_offset=0.0,
         )
 
+    def draw_row(text: str, y: float, font_size: int, height: float,
+                 *, ellipsize: bool = False, badge: bool = False) -> None:
+      text, size = self._fit_turn_hud_text(text, font_size, text_width, height, ellipsize=ellipsize)
+      if not text:
+        return
+      if badge:
+        measured = measure_text_cached(self._font_bold, text, size)
+        box_h = max(48, int(measured.y + 12))
+        self._draw_round_box(
+          text_x - 10, y - 6, int(measured.x) + 20, box_h, rl.GREEN,
+          roundness=10.0 / box_h, segments=8, line_thickness=0,
+        )
+      draw_text_ui_style(
+        text, text_x, y, size, rl.WHITE, font=self._font_bold,
+        border_width=2.0, shadow_offset=4.0, align="left_top", y_offset=0.0,
+      )
+
+    draw_row(info["tbt_main_text"], tbt_y - 42, 40, 48, ellipsize=True)
+    draw_row(self._format_eta_text(n_go_pos_time), tbt_y + 22, 50, 55)
+    draw_row(self._format_go_pos_distance_text(n_go_pos_dist), tbt_y + 88, 50, 55)
     if info["sdi_descr"]:
-      label_x = tbt_x + 200
-      label_y = tbt_y + 200
-      size = measure_text_cached(self._font_bold, info["sdi_descr"], 40)
-      box_h = max(48, int(size.y + 13))
-      self._draw_round_box(
-        label_x - 10,
-        label_y - int(size.y) - 2,
-        int(size.x) + 20,
-        box_h,
-        rl.GREEN,
-        roundness=10.0 / box_h,
-        segments=8,
-        line_thickness=0,
-      )
-      self._draw_text_left_bottom(
-        info["sdi_descr"], label_x, label_y, 40, rl.WHITE,
-        font=self._font_bold, border_width=1.5, shadow_offset=3.0,
-      )
-    elif info["road_name"]:
-      self._draw_text_left_bottom(
-        info["road_name"], tbt_x + 200, tbt_y + 200, 40, rl.WHITE,
-        font=self._font_bold, border_width=1.5, shadow_offset=3.0,
-      )
-
-    eta_text = self._format_eta_text(n_go_pos_time)
-    if eta_text:
-      self._draw_text_left_bottom(
-        eta_text, tbt_x + 190, tbt_y + 80, 50, rl.WHITE,
-        font=self._font_bold, border_width=2.0, shadow_offset=4.0,
-      )
-
-    go_dist_text = self._format_go_pos_distance_text(n_go_pos_dist)
-    if go_dist_text:
-      self._draw_text_left_bottom(
-        go_dist_text, tbt_x + 310, tbt_y + 130, 50, rl.WHITE,
-        font=self._font_bold, border_width=2.0, shadow_offset=4.0,
-      )
+      draw_row(info["sdi_descr"], tbt_y + 160, 40, 45, ellipsize=True, badge=True)
+    else:
+      draw_row(info["road_name"], tbt_y + 160, 40, 45, ellipsize=True)
 
   def _draw_set_speed_carrot(self, rect: rl.Rectangle) -> None:
 
