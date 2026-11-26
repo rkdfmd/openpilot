@@ -45,6 +45,9 @@ jobs:
             opendbc_repo/opendbc/safety/tests/test_pedal_interceptor.py \
             opendbc_repo/opendbc/car/hyundai/tests/test_alt2_adas_buttons.py \
             opendbc_repo/opendbc/safety/tests/test_hyundai_canfd_alt_buttons.py \
+            opendbc_repo/opendbc/safety/tests/test_hyundai_canfd_fwd_timer.py \
+            opendbc_repo/opendbc/safety/tests/test_hyundai_canfd_cluster.py \
+            opendbc_repo/opendbc/safety/tests/test_hyundai_canfd_bfwd_trim.py \
             opendbc_repo/opendbc/car/hyundai/tests/test_spas.py \
             opendbc_repo/opendbc/safety/tests/test_hyundai_spas.py \
             openpilot/selfdrive/car/tests/test_hyundai_spas.py \
@@ -85,6 +88,7 @@ jobs:
             opendbc_repo/opendbc/car/hyundai/tests/test_aprk_blinkers.py \
             opendbc_repo/opendbc/car/hyundai/tests/test_camera_set_speed_sync.py \
             opendbc_repo/opendbc/car/hyundai/tests/test_ccnc_cluster.py \
+            opendbc_repo/opendbc/car/hyundai/tests/test_pv5_stock_cluster_lanes.py \
             opendbc_repo/opendbc/car/hyundai/tests/test_stock_cruise_adopt.py \
             opendbc_repo/opendbc/safety/tests/test_hyundai_canfd_spas_piggyback.py \
             openpilot/selfdrive/carrot/tests/test_radar_moving_lead_shield.py \
